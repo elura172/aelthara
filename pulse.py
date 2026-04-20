@@ -249,6 +249,7 @@ async def poll_markets():
                     taf_tx=reading.tx_celsius,  # Actual TAF temperature
                     market_threshold=rung.threshold_celsius,
                     market_prob=rung.market_price,
+                    outcome_type=rung.outcome_type,
                 )
                 result = executor.execute(decision, f"{icao}_{rung.market_id}", BANKROLL)
                 if result.get("status") == "executed":

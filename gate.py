@@ -39,7 +39,7 @@ class MirrorGate:
     Core gate: assess whether a market is mispriced enough to act.
 
     Uses a probability-aware decision model:
-      - model_prob = prob_above(mean, std, market_threshold)  (P(temp >= threshold))
+      - model_prob = prob_above(...) for "above" markets, prob_below(...) for "below" markets
       - market_prob = market_price (the YES probability from CLOB)
       - edge = model_prob - market_prob
     """
@@ -47,7 +47,13 @@ class MirrorGate:
     def __init__(self, kill_threshold: float = 1.5):
         self.kill_threshold = kill_threshold
 
-    def assess(self, taf_tx: float, market_threshold: float, market_prob: float) -> GateDecision:
+    def assess(
+        self,
+        taf_tx: float,
+        market_threshold: float,
+        market_prob: float,
+        outcome_type: str = "above",
+    ) -> GateDecision:
         """
         Assess whether a market is mispriced.
 
@@ -55,6 +61,7 @@ class MirrorGate:
             taf_tx: The TAF-predicted max temperature (°C).
             market_threshold: The temperature threshold in the market question.
             market_prob: The market's YES probability (0-1).
+            outcome_type: Market direction, "above" (>=) or "below" (<=).
 
         Returns:
             GateDecision with action, human-readable reason, and edge.
@@ -76,7 +83,12 @@ class MirrorGate:
             )
 
         # Probability-aware decision logic
-        action, detail, edge, model_prob, market_prob = self._decide_action(taf_tx, market_threshold, market_prob)
+        action, detail, edge, model_prob, market_prob = self._decide_action(
+            taf_tx,
+            market_threshold,
+            market_prob,
+            outcome_type=outcome_type,
+        )
         reason = f"{action} | {detail} | ΔT={diff:.1f}°"
 
         return GateDecision(
@@ -91,14 +103,27 @@ class MirrorGate:
             market_prob=market_prob,
         )
 
-    def _decide_action(self, taf_tx: float, market_threshold: float, market_prob: float) -> tuple[str, str, float, float, float]:
+    def _decide_action(
+        self,
+        taf_tx: float,
+        market_threshold: float,
+        market_prob: float,
+        outcome_type: str = "above",
+    ) -> tuple[str, str, float, float, float]:
         """Probability-aware trading decisions."""
-        # Model probability: P(temp >= threshold) under Gaussian(TX, std=2°)
-        model_prob = prob_above(
-            mean=taf_tx,
-            std=2.0,
-            threshold=market_threshold,
-        )
+        # Model probability depends on market type.
+        if outcome_type == "below":
+            model_prob = prob_below(
+                mean=taf_tx,
+                std=2.0,
+                threshold=market_threshold,
+            )
+        else:
+            model_prob = prob_above(
+                mean=taf_tx,
+                std=2.0,
+                threshold=market_threshold,
+            )
         edge = model_prob - market_prob
 
         # --- SELL expensive YES (your main engine) ---

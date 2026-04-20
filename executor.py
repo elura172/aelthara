@@ -14,8 +14,6 @@ from gate import GateDecision, to_distribution, prob_above, prob_below, prob_ban
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 CHAIN_ID = 137
-KELLY_FRACTION = 0.10
-MAX_ORDER = 5.0
 MIN_ORDER = 1.0
 DRY_RUN = os.environ.get("MIRROR_DRY_RUN", "true").lower() != "false"
 
@@ -249,10 +247,13 @@ class Executor:
     def size_for_edge(self, edge: float, bankroll: Optional[float] = None) -> float:
         """Capital allocation: size = bankroll × edge × k, bounded by risk rules."""
         b = bankroll if bankroll is not None else self.bankroll
+        if edge <= 0:
+            return 0.0
+
         k = 3.0
-        size = b * abs(edge) * k  # Use absolute edge for sizing
+        size = b * edge * k
         size = min(size, b * 0.05)
-        size = max(size, 5.0)
+        size = max(size, MIN_ORDER)
         return round(size, 2)
 
     # ── Execution ───────────────────────────────────────────────────────────
