@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+DEFAULT_PREDICTABILITY = 80.0
+
 # ICAO to coordinates mapping
 ICAO_COORDS = {
     "KJFK": (40.6413, -73.7781), "KLAX": (33.9416, -118.4085), "KORD": (41.9742, -87.9073),
@@ -57,6 +59,17 @@ class TAFReading:
             f"TAF {self.icao}  TX={self.tx_celsius:.0f}°C "
             f"({self.tx_fahrenheit:.0f}°F)  issued={self.issued_at} [{self.source}]"
         )
+
+
+def _sigma_from_predictability(predictability: float) -> float:
+    """Calculate Gaussian σ from Meteoblue predictability (0-100)."""
+    if predictability >= 80:
+        return 1.5
+    if predictability >= 70:
+        return 2.0
+    if predictability >= 60:
+        return 2.5
+    return 3.0
 
 
 class Oracle:
@@ -126,7 +139,7 @@ class Oracle:
         if peak_info:
             tx = peak_info["peak_c"]
             predictability = peak_info["predictability"]
-            sigma = self._calculate_sigma_from_predictability(predictability)
+            sigma = peak_info["sigma_c"]
         else:
             # Backward compatibility for older payload structure
             data = meteoblue_data.get("data", {})
@@ -135,7 +148,7 @@ class Oracle:
             if not values:
                 return None
             tx = float(max(values))
-            predictability = 80.0
+            predictability = DEFAULT_PREDICTABILITY
             sigma = self._calculate_sigma_from_predictability(predictability)
 
         dist = {"mean": float(tx), "std": sigma}
@@ -233,13 +246,7 @@ class Oracle:
 
     def _calculate_sigma_from_predictability(self, predictability: float) -> float:
         """Calculate Gaussian σ from Meteoblue predictability (0-100)."""
-        if predictability >= 80:
-            return 1.5
-        if predictability >= 70:
-            return 2.0
-        if predictability >= 60:
-            return 2.5
-        return 3.0
+        return _sigma_from_predictability(predictability)
 
     def _parse_tx(self, raw: str) -> float:
         m = re.search(r"TX(M?)(\d+)/", raw)
@@ -274,27 +281,20 @@ def get_daily_peak_from_basic_1h(meteoblue_data: Dict[str, Any]) -> Optional[Dic
             except (TypeError, ValueError):
                 continue
         predictability = (
-            sum(predictability_values) / len(predictability_values) if predictability_values else 80.0
+            sum(predictability_values) / len(predictability_values)
+            if predictability_values
+            else DEFAULT_PREDICTABILITY
         )
     elif predictability_data is None:
-        predictability = 80.0
+        predictability = DEFAULT_PREDICTABILITY
     else:
         try:
             predictability = float(predictability_data)
         except (TypeError, ValueError):
-            predictability = 80.0
-
-    if predictability >= 80:
-        sigma = 1.5
-    elif predictability >= 70:
-        sigma = 2.0
-    elif predictability >= 60:
-        sigma = 2.5
-    else:
-        sigma = 3.0
+            predictability = DEFAULT_PREDICTABILITY
 
     return {
         "peak_c": float(max(numeric_temps)),
-        "sigma_c": sigma,
+        "sigma_c": _sigma_from_predictability(predictability),
         "predictability": float(predictability),
     }
