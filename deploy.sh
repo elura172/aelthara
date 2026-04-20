@@ -162,7 +162,7 @@ status() {
 }
 
 logs() {
-    tail -f "${APP_DIR}/pulse.log" "${APP_DIR}/telegram.log"
+    tail -F "${APP_DIR}/pulse.log" "${APP_DIR}/telegram.log"
 }
 
 usage() {

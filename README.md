@@ -74,7 +74,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/aelthara_deploy -N ""
 echo "Host github-aelthara
     HostName github.com
     User git
-    IdentityFile ~/.ssh/aelthara_deploy" > ~/.ssh/config
+    IdentityFile ~/.ssh/aelthara_deploy" >> ~/.ssh/config
 
 # Clone
 git clone github-aelthara:elura172/aelthara.git
