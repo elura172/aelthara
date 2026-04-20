@@ -11,7 +11,7 @@ import httpx
 from dotenv import load_dotenv
 
 from gate import decide_signal, prob_above, prob_below
-from signal import Confidence, OracleSignal
+from signal import Confidence, OracleSignal, SignalType
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -72,6 +72,9 @@ class Oracle:
     STD_DEGREE_C: float = 2.0
     KILL_THRESHOLD = 1.5
     MAX_POSITION = 0.05
+    TAF_WEIGHT_SHORT = 0.15
+    TAF_WEIGHT_LONG = 0.30
+    NOWCAST_SIGMA_FACTOR = 0.85
 
     def __init__(self, icao: str):
         self.icao = icao.upper()
@@ -237,7 +240,7 @@ class Oracle:
     def _calculate_daily_max(self, hourly_temps: list[float], hourly_times: list[str], target_date: str) -> float:
         day_temps = []
         for temp, time_str in zip(hourly_temps, hourly_times):
-            if str(time_str).startswith(target_date):
+            if time_str.startswith(target_date):
                 day_temps.append(float(temp))
         if not day_temps:
             raise ValueError(f"No temperatures found for {target_date}")
@@ -267,7 +270,13 @@ class Oracle:
     def _calculate_kelly(self, edge: float, model_prob: float, market_prob: float) -> float:
         if edge <= 0:
             return 0.0
-        kelly = abs(edge) * 0.5
+        if 0 < market_prob < 1:
+            odds = (1 - market_prob) / market_prob
+            q = 1 - model_prob
+            raw_kelly = ((model_prob * odds) - q) / odds if odds > 0 else 0.0
+            kelly = max(0.0, raw_kelly) * 0.5
+        else:
+            kelly = edge * 0.5
         return min(kelly, self.MAX_POSITION)
 
     def _extract_predictability(self, data: dict) -> float | None:
@@ -368,13 +377,13 @@ class Oracle:
         model_mean = daily_max
         taf_note = "TAF unavailable"
         if taf:
-            taf_weight = 0.15 if hours_to_resolution <= 12 else 0.30
+            taf_weight = self.TAF_WEIGHT_SHORT if hours_to_resolution <= 12 else self.TAF_WEIGHT_LONG
             model_mean = (1.0 - taf_weight) * daily_max + taf_weight * taf.tx_celsius
             taf_note = "TAF confirms" if abs(taf.tx_celsius - daily_max) < 1.5 else "TAF adjusts"
 
         sigma = self._calculate_sigma(predictability)
         if source == "meteoblue" and hours_to_resolution <= 12:
-            sigma *= 0.85
+            sigma *= self.NOWCAST_SIGMA_FACTOR
 
         if outcome_type == "below":
             model_prob = prob_below(model_mean, sigma, threshold_celsius)
@@ -387,11 +396,18 @@ class Oracle:
         confidence = self._calculate_confidence(predictability, hours_to_resolution)
         signal = decide_signal(model_prob, market_prob)
         kelly_fraction = self._calculate_kelly(edge_decimal, model_prob, market_prob)
+        if abs(model_mean - threshold_celsius) < self.KILL_THRESHOLD:
+            signal = SignalType.PASS
+            edge_points = 0
+            kelly_fraction = 0.0
 
-        reason = (
-            f"{source} basic-1h daily max {daily_max:.1f}°C, {taf_note.lower()} "
-            f"(TAF={taf.tx_celsius:.1f}°C)" if taf else f"{source} daily max {daily_max:.1f}°C, {taf_note.lower()}"
-        )
+        if taf:
+            taf_detail = f" (TAF={taf.tx_celsius:.1f}°C)"
+            reason = f"{source} basic-1h daily max {daily_max:.1f}°C, {taf_note.lower()}{taf_detail}"
+        else:
+            reason = f"{source} daily max {daily_max:.1f}°C, {taf_note.lower()}"
+        if signal == SignalType.PASS and abs(model_mean - threshold_celsius) < self.KILL_THRESHOLD:
+            reason = f"{reason}; within {self.KILL_THRESHOLD:.1f}°C kill threshold"
 
         return OracleSignal(
             market=market_question,

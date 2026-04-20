@@ -5,6 +5,8 @@ from scipy.stats import norm
 
 from signal import SignalType
 
+MODEL_STD_DEG_C = 2.0
+
 
 @dataclass
 class GateDecision:
@@ -13,7 +15,7 @@ class GateDecision:
     taf_tx: float
     market_threshold: float
     reason: str
-    action: str       # "PASS", "SELL_NO", "BUY_YES", "LEAN_YES", "LEAN_NO", "MID_VALUE"
+    action: str       # String value of SignalType (PASS/SELL_NO/BUY_YES/LEAN_YES/LEAN_NO/MID_VALUE)
     edge: float = 0.0
     model_prob: float = 0.0
     market_prob: float = 0.0
@@ -110,7 +112,8 @@ class MirrorGate:
 
     def _decide_action(self, taf_tx: float, market_threshold: float, market_prob: float, outcome_type: str) -> tuple[str, str, float, float, float]:
         """Probability-aware trading decisions."""
-        model_prob = prob_below(mean=taf_tx, std=2.0, threshold=market_threshold) if outcome_type == "below" else prob_above(mean=taf_tx, std=2.0, threshold=market_threshold)
+        prob_kwargs = {"mean": taf_tx, "std": MODEL_STD_DEG_C, "threshold": market_threshold}
+        model_prob = prob_below(**prob_kwargs) if outcome_type == "below" else prob_above(**prob_kwargs)
         edge = model_prob - market_prob
         signal = decide_signal(model_prob, market_prob)
 
