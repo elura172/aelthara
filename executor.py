@@ -213,7 +213,7 @@ class Executor:
         try:
             r = httpx.get(
                 f"{GAMMA_BASE}/markets",
-                params={"keyword": f"{city} temperature", "closed": "false", "limit": 50},
+                params={"q": f"{city} temperature", "closed": "false", "limit": 50},
                 timeout=12,
             )
             r.raise_for_status()
