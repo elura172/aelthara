@@ -62,7 +62,7 @@ class Oracle:
     """Pulls temperature — Meteoblue primary, TAF for issued time, Open-Meteo fallback."""
 
     AWC = "https://aviationweather.gov/api/data/taf"
-    METEOBLUE = "https://api.meteoblue.com/v1/forecast"
+    METEOBLUE = "https://my.meteoblue.com/packages/basic-1h"
     OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
     STD_DEGREE_C: float = 2.0
 
@@ -113,16 +113,13 @@ class Oracle:
                 "lat": lat,
                 "lon": lon,
                 "format": "json",
-                "products": ["temperature_2m"],
-                "forecast_days": 1,
             },
             timeout=12,
         )
         r.raise_for_status()
-        data = r.json().get("data", {})
-
-        temp_data = data.get("temperature_2m", {})
-        values = temp_data.get("values", [])
+        data = r.json()
+        temp_data = data.get("data_1h", {})
+        values = temp_data.get("temperature", [])
 
         if not values:
             return None
