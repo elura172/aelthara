@@ -137,19 +137,19 @@ class WeatherData:
                 result['sources'].append('open_meteo')
         
         # Wind: TAF → Meteoblue → Open-Meteo
-        if tafand taf.get('wind_speed'):
+        if taf and taf.get('wind_speed'):
             result['wind_speed'] = taf['wind_speed']
             result['wind_dir'] = taf.get('wind_dir')
             result['sources'].append('taf')
         elif mb and mb.get('wind_speed'):
             result['wind_speed'] = mb['wind_speed']
             result['sources'].append('meteoblue')
-        elif omand om.get('wind_speed'):
+        elif om and om.get('wind_speed'):
             result['wind_speed'] = om['wind_speed']
             result['sources'].append('open_meteo')
         
         # Visibility from TAF only
-        if tafand taf.get('visibility'):
+        if taf and taf.get('visibility'):
             result['visibility'] = taf['visibility']
             result['sources'].append('taf')
         
