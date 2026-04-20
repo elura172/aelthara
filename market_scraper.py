@@ -7,7 +7,7 @@ and matches them to ICAO cities for TAF ↔ Market comparison.
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 import httpx
@@ -86,7 +86,6 @@ CITY_ALIASES = {
     "lis": "lisbon",
     # Asian cities
     "tyo": "tokyo",
-    "tyo": "tokyo",
     "sel": "seoul",
     "sin": "singapore",
     "hkg": "hong kong",
@@ -150,7 +149,7 @@ class MarketScraper:
                 no_price=float(prices[1]) if len(prices) > 1 else 0.5,
                 outcome_type="band",
                 question=question,
-                last_traded_at=str(raw.get("lastTradedAt", datetime.utcnow().isoformat())),
+                last_traded_at=str(raw.get("lastTradedAt", datetime.now(timezone.utc).isoformat())),
             )
         # Scalar markets — fallback generic parsing
         outcomes = json.loads(raw.get("outcomes", "[]"))
@@ -165,7 +164,7 @@ class MarketScraper:
                 no_price=float(prices[1]) if len(prices) > 1 else 0.5,
                 outcome_type=raw.get("outcomeType", "scalar"),
                 question=question,
-                last_traded_at=str(raw.get("lastTradedAt", datetime.utcnow().isoformat())),
+                last_traded_at=str(raw.get("lastTradedAt", datetime.now(timezone.utc).isoformat())),
             )
         return None
 
