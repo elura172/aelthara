@@ -26,6 +26,9 @@ ICAO_TIMEZONES = {
     "RJTT": 9, "RKSS": 9, "WSSS": 8, "VHHH": 8,
     "ZBAA": 8, "ZSPD": 8, "YSSY": 10, "NZAA": 12,
     "SBGR": -3, "SAEZ": -3,
+    "KDFW": -5, "KIAH": -5, "KPHX": -7, "KLAS": -7,
+    "LEMD": 2, "LIRF": 2, "EDDM": 2, "EIDW": 1,
+    "VTBS": 7, "VABB": 5, "VIDP": 5, "RCTP": 8,
 }
 
 
