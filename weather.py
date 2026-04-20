@@ -2,7 +2,7 @@
 Simple weather data from Meteoblue + TAF with Open-Meteo backup.
 """
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 
@@ -46,28 +46,39 @@ class WeatherData:
         """Fetch from Meteoblue."""
         try:
             r = httpx.get(
-                "https://api.meteoblue.com/v1/forecast",
+                "https://my.meteoblue.com/packages/basic-1h",
                 params={
                     'apikey': self.meteoblue_key,
                     'lat': lat, 'lon': lon,
                     'format': 'json',
-                    'products': ['temperature_2m', 'precipitation', 'wind_speed_10m'],
-                    'forecast_days': 1
                 },
                 timeout=10.0
             )
             r.raise_for_status()
-            data = r.json().get('data', {})
+            data = r.json()
+            data_1h = data.get('data_1h', {})
             
             # Get current hour values
-            now = int(datetime.now().timestamp())
-            times = data.get('temperature_2m', {}).get('time', [])
-            idx = min(range(len(times)), key=lambda i: abs(times[i] - now))
+            time_strs = data_1h.get('time', [])
+            if not time_strs:
+                return None
+
+            now = datetime.now(timezone.utc)
+            idx = 0
+            try:
+                timestamps = [datetime.fromisoformat(t.replace('Z', '+00:00')) for t in time_strs]
+                idx = min(range(len(timestamps)), key=lambda i: abs((timestamps[i] - now).total_seconds()))
+            except Exception:
+                idx = 0
+
+            temps = data_1h.get('temperature', [])
+            precip = data_1h.get('precipitation', [])
+            wind = data_1h.get('windspeed', [])
             
             return {
-                'temperature': data.get('temperature_2m', {}).get('values', [None]*len(times))[idx],
-                'precipitation': data.get('precipitation', {}).get('values', [0]*len(times))[idx],
-                'wind_speed': data.get('wind_speed_10m', {}).get('values', [0]*len(times))[idx],
+                'temperature': temps[idx] if idx < len(temps) else None,
+                'precipitation': precip[idx] if idx < len(precip) else 0,
+                'wind_speed': wind[idx] if idx < len(wind) else 0,
             }
         except Exception:
             return None
@@ -137,19 +148,19 @@ class WeatherData:
                 result['sources'].append('open_meteo')
         
         # Wind: TAF → Meteoblue → Open-Meteo
-        if tafand taf.get('wind_speed'):
+        if taf and taf.get('wind_speed'):
             result['wind_speed'] = taf['wind_speed']
             result['wind_dir'] = taf.get('wind_dir')
             result['sources'].append('taf')
         elif mb and mb.get('wind_speed'):
             result['wind_speed'] = mb['wind_speed']
             result['sources'].append('meteoblue')
-        elif omand om.get('wind_speed'):
+        elif om and om.get('wind_speed'):
             result['wind_speed'] = om['wind_speed']
             result['sources'].append('open_meteo')
         
         # Visibility from TAF only
-        if tafand taf.get('visibility'):
+        if taf and taf.get('visibility'):
             result['visibility'] = taf['visibility']
             result['sources'].append('taf')
         
