@@ -46,6 +46,7 @@ class TAFReading:
     raw: str
     source: str = "meteoblue"  # "meteoblue", "taf", or "openmeteo"
     distribution: Dict[str, float] = field(default_factory=lambda: {"mean": 0.0, "std": 2.0})
+    predictability: Optional[float] = None
 
     @property
     def tx_fahrenheit(self) -> float:
@@ -119,25 +120,37 @@ class Oracle:
             timeout=12,
         )
         r.raise_for_status()
-        data = r.json().get("data", {})
+        data = r.json()
 
-        temp_data = data.get("temperature_2m", {})
-        values = temp_data.get("values", [])
+        peak = self.get_daily_peak_from_basic_1h(data)
+        if peak:
+            tx = peak["peak_c"]
+            predictability = peak["predictability"]
+            sigma = peak["sigma_c"]
+        else:
+            # Backward-compatible fallback for older Meteoblue response shape.
+            legacy_data = data.get("data", {})
+            temp_data = legacy_data.get("temperature_2m", {})
+            values = temp_data.get("values", [])
+            if not values:
+                return None
+            tx = max(values)
+            predictability = None
+            sigma = self.STD_DEGREE_C
 
-        if not values:
-            return None
-
-        # Get max from hourly values
-        tx = max(values)
-        dist = self.to_distribution(tx)
+        dist = {"mean": float(tx), "std": float(sigma)}
+        raw = "Meteoblue daily max"
+        if predictability is not None:
+            raw = f"Meteoblue daily max (predictability: {predictability:.0f}%)"
 
         return TAFReading(
             icao=self.icao,
             tx_celsius=tx,
             issued_at=datetime.now(timezone.utc).isoformat(),
-            raw="Meteoblue daily max",
+            raw=raw,
             source="meteoblue",
             distribution=dist,
+            predictability=predictability,
         )
 
     def _pull_taf(self) -> Optional[TAFReading]:
@@ -220,6 +233,46 @@ class Oracle:
 
     def to_distribution(self, tx_celsius: float) -> Dict[str, float]:
         return {"mean": float(tx_celsius), "std": self.STD_DEGREE_C}
+
+    def _calculate_sigma_from_predictability(self, predictability: float) -> float:
+        """
+        Calculate Gaussian σ based on Meteoblue predictability score.
+
+        Args:
+            predictability: Meteoblue predictability (0-100%)
+
+        Returns:
+            Sigma value for Gaussian distribution
+        """
+        if predictability >= 80:
+            return 1.5
+        if predictability >= 70:
+            return 2.0
+        if predictability >= 60:
+            return 2.5
+        return 3.0
+
+    def get_daily_peak_from_basic_1h(self, meteoblue_data: Dict) -> Optional[Dict[str, float]]:
+        """Extract daily max and predictability from Meteoblue basic-1h response."""
+        data_1h = meteoblue_data.get("data_1h", {})
+        hourly_temps = data_1h.get("temperature", [])
+        if not hourly_temps:
+            return None
+
+        tx = max(hourly_temps)
+
+        predictability = data_1h.get("predictability")
+        if isinstance(predictability, list):
+            predictability = sum(predictability) / len(predictability) if predictability else 80
+        elif predictability is None:
+            predictability = 80
+
+        sigma = self._calculate_sigma_from_predictability(float(predictability))
+        return {
+            "peak_c": float(tx),
+            "predictability": float(predictability),
+            "sigma_c": sigma,
+        }
 
     def _parse_tx(self, raw: str) -> float:
         m = re.search(r"TX(M?)(\d+)/", raw)
