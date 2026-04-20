@@ -1,6 +1,7 @@
 """Pulse — Main orchestration loop. Oracle + MirrorGate + Executor."""
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -249,7 +250,16 @@ async def poll_markets():
                     taf_tx=reading.tx_celsius,  # Actual TAF temperature
                     market_threshold=rung.threshold_celsius,
                     market_prob=rung.market_price,
+                    outcome_type=rung.outcome_type,
                 )
+                signal = oracle.generate_signal(
+                    market_question=rung.question,
+                    market_price_cents=int(round(rung.market_price * 100)),
+                    resolution_time=datetime.now(timezone.utc) + timedelta(days=1),
+                    threshold_celsius=rung.threshold_celsius,
+                    outcome_type=rung.outcome_type,
+                )
+                logger.info("signal=%s", json.dumps(signal.to_json(), ensure_ascii=False))
                 result = executor.execute(decision, f"{icao}_{rung.market_id}", BANKROLL)
                 if result.get("status") == "executed":
                     logger.info(f"Trade executed: {decision} {result.get('trade', {}).get('quantity', 0):.2f} @ ${result.get('trade', {}).get('price', 0):.2f}")

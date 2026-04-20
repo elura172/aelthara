@@ -269,7 +269,7 @@ class Executor:
             "SELL_NO": "SELL_NO",
             "LEAN_YES": "LEAN_BUY",
             "LEAN_NO": "LEAN_SELL",
-            "MID VALUE": "MID_VALUE",
+            "MID_VALUE": "MID_VALUE",
         }
 
         action_label = action_map.get(decision.action, "UNKNOWN")

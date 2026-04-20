@@ -2,6 +2,7 @@
 
 import os
 import re
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -9,7 +10,11 @@ from typing import Dict, Optional
 import httpx
 from dotenv import load_dotenv
 
+from gate import decide_signal, prob_above, prob_below
+from signal import Confidence, OracleSignal
+
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 # ICAO to coordinates mapping
 ICAO_COORDS = {
@@ -65,6 +70,8 @@ class Oracle:
     METEOBLUE = "https://api.meteoblue.com/v1/forecast"
     OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
     STD_DEGREE_C: float = 2.0
+    KILL_THRESHOLD = 1.5
+    MAX_POSITION = 0.05
 
     def __init__(self, icao: str):
         self.icao = icao.upper()
@@ -79,7 +86,7 @@ class Oracle:
             if reading:
                 return reading
         except Exception as e:
-            print(f"[Oracle] Meteoblue failed for {self.icao}: {e}")
+            logger.warning("Meteoblue failed for %s: %s", self.icao, e)
 
         # Try TAF
         try:
@@ -87,7 +94,7 @@ class Oracle:
             if reading:
                 return reading
         except Exception as e:
-            print(f"[Oracle] TAF failed for {self.icao}: {e}")
+            logger.warning("TAF failed for %s: %s", self.icao, e)
 
         # Fallback to Open-Meteo
         try:
@@ -226,3 +233,174 @@ class Oracle:
         if not m:
             raise ValueError(f"No TX group found in TAF for {self.icao}")
         return (-1.0 if m.group(1) == "M" else 1.0) * float(m.group(2))
+
+    def _calculate_daily_max(self, hourly_temps: list[float], hourly_times: list[str], target_date: str) -> float:
+        day_temps = []
+        for temp, time_str in zip(hourly_temps, hourly_times):
+            if str(time_str).startswith(target_date):
+                day_temps.append(float(temp))
+        if not day_temps:
+            raise ValueError(f"No temperatures found for {target_date}")
+        return max(day_temps)
+
+    def _calculate_confidence(self, predictability: float | None, hours_to_resolution: int) -> Confidence:
+        if hours_to_resolution <= 12:
+            return Confidence.HIGH
+        if predictability is None:
+            return Confidence.MEDIUM
+        if predictability >= 70:
+            return Confidence.HIGH
+        if predictability >= 50:
+            return Confidence.MEDIUM
+        return Confidence.LOW
+
+    def _calculate_sigma(self, predictability: float | None) -> float:
+        base_sigma = 2.0
+        if predictability is None:
+            return base_sigma
+        if predictability >= 70:
+            return base_sigma
+        if predictability >= 50:
+            return base_sigma * 1.25
+        return base_sigma * 1.5
+
+    def _calculate_kelly(self, edge: float, model_prob: float, market_prob: float) -> float:
+        if edge <= 0:
+            return 0.0
+        kelly = abs(edge) * 0.5
+        return min(kelly, self.MAX_POSITION)
+
+    def _extract_predictability(self, data: dict) -> float | None:
+        for key in ("predictability", "predictability_score"):
+            value = data.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        meta = data.get("metadata", {})
+        for key in ("predictability", "predictability_score"):
+            value = meta.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+
+    def _pull_meteoblue_hourly(self) -> tuple[list[float], list[str], float | None]:
+        if not self._meteoblue_key:
+            raise ValueError("Meteoblue key not configured")
+        coords = ICAO_COORDS.get(self.icao)
+        if not coords:
+            raise ValueError(f"No coordinates for {self.icao}")
+        lat, lon = coords
+        r = httpx.get(
+            self.METEOBLUE,
+            params={
+                "apikey": self._meteoblue_key,
+                "lat": lat,
+                "lon": lon,
+                "format": "json",
+                "models": "basic-1h",
+                "forecast_days": 3,
+            },
+            timeout=12,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data", {})
+        temp_data = data.get("temperature_2m", {})
+        hourly_temps = temp_data.get("values", [])
+        hourly_times = temp_data.get("time", [])
+        if not hourly_temps or not hourly_times:
+            raise ValueError("Missing hourly Meteoblue temperature data")
+        return hourly_temps, hourly_times, self._extract_predictability(payload)
+
+    def _pull_openmeteo_daily_max(self, target_date: str) -> float:
+        coords = ICAO_COORDS.get(self.icao)
+        if not coords:
+            raise ValueError(f"No coordinates for {self.icao}")
+        lat, lon = coords
+        r = httpx.get(
+            self.OPEN_METEO,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max",
+                "start_date": target_date,
+                "end_date": target_date,
+                "timezone": "auto",
+            },
+            timeout=12,
+        )
+        r.raise_for_status()
+        daily = r.json().get("daily", {})
+        temps = daily.get("temperature_2m_max", [])
+        if not temps:
+            raise ValueError(f"No daily temp in Open-Meteo response for {self.icao} on {target_date}")
+        return float(temps[0])
+
+    def generate_signal(
+        self,
+        market_question: str,
+        market_price_cents: int,
+        resolution_time: datetime,
+        threshold_celsius: float,
+        outcome_type: str = "above",
+    ) -> OracleSignal:
+        now = datetime.now(timezone.utc)
+        if resolution_time.tzinfo is None:
+            resolution_time = resolution_time.replace(tzinfo=timezone.utc)
+        hours_to_resolution = max(0, int((resolution_time - now).total_seconds() / 3600))
+        target_date = resolution_time.strftime("%Y-%m-%d")
+
+        source = "meteoblue"
+        predictability = None
+        taf = None
+        try:
+            hourly_temps, hourly_times, predictability = self._pull_meteoblue_hourly()
+            daily_max = self._calculate_daily_max(hourly_temps, hourly_times, target_date)
+        except Exception as err:
+            logger.warning("Meteoblue hourly unavailable for %s: %s", self.icao, err)
+            source = "openmeteo"
+            daily_max = self._pull_openmeteo_daily_max(target_date)
+
+        try:
+            taf = self._pull_taf()
+        except Exception as err:
+            logger.warning("TAF unavailable for %s: %s", self.icao, err)
+
+        model_mean = daily_max
+        taf_note = "TAF unavailable"
+        if taf:
+            taf_weight = 0.15 if hours_to_resolution <= 12 else 0.30
+            model_mean = (1.0 - taf_weight) * daily_max + taf_weight * taf.tx_celsius
+            taf_note = "TAF confirms" if abs(taf.tx_celsius - daily_max) < 1.5 else "TAF adjusts"
+
+        sigma = self._calculate_sigma(predictability)
+        if source == "meteoblue" and hours_to_resolution <= 12:
+            sigma *= 0.85
+
+        if outcome_type == "below":
+            model_prob = prob_below(model_mean, sigma, threshold_celsius)
+        else:
+            model_prob = prob_above(model_mean, sigma, threshold_celsius)
+
+        market_prob = max(0.0, min(1.0, market_price_cents / 100.0))
+        edge_decimal = model_prob - market_prob
+        edge_points = int(round(model_prob * 100 - market_price_cents))
+        confidence = self._calculate_confidence(predictability, hours_to_resolution)
+        signal = decide_signal(model_prob, market_prob)
+        kelly_fraction = self._calculate_kelly(edge_decimal, model_prob, market_prob)
+
+        reason = (
+            f"{source} basic-1h daily max {daily_max:.1f}°C, {taf_note.lower()} "
+            f"(TAF={taf.tx_celsius:.1f}°C)" if taf else f"{source} daily max {daily_max:.1f}°C, {taf_note.lower()}"
+        )
+
+        return OracleSignal(
+            market=market_question,
+            model_mean_c=model_mean,
+            model_prob=model_prob,
+            market_price=market_price_cents,
+            edge=edge_points,
+            confidence=confidence,
+            signal=signal,
+            reason=reason,
+            kelly_fraction=kelly_fraction,
+        )

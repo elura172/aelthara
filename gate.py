@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from scipy.stats import norm
 
+from signal import SignalType
+
 
 @dataclass
 class GateDecision:
@@ -11,7 +13,7 @@ class GateDecision:
     taf_tx: float
     market_threshold: float
     reason: str
-    action: str       # "PASS", "SELL_NO", "BUY_YES", "LEAN_YES", "LEAN_NO", "MID VALUE"
+    action: str       # "PASS", "SELL_NO", "BUY_YES", "LEAN_YES", "LEAN_NO", "MID_VALUE"
     edge: float = 0.0
     model_prob: float = 0.0
     market_prob: float = 0.0
@@ -34,6 +36,21 @@ def prob_below(mean: float, std: float, threshold: float) -> float:
     return norm.cdf(threshold, mean, std)
 
 
+def decide_signal(model_prob: float, market_prob: float) -> SignalType:
+    edge = model_prob - market_prob
+    if market_prob > 0.95 and model_prob < 0.93:
+        return SignalType.SELL_NO
+    if market_prob < 0.02 and model_prob > 0.05:
+        return SignalType.BUY_YES
+    if 0.15 <= market_prob <= 0.40 and model_prob > market_prob + 0.15:
+        return SignalType.LEAN_YES
+    if 0.60 <= market_prob <= 0.85 and model_prob < market_prob - 0.15:
+        return SignalType.LEAN_NO
+    if 0.3 < market_prob < 0.7 and edge > 0.15:
+        return SignalType.MID_VALUE
+    return SignalType.PASS
+
+
 class MirrorGate:
     """
     Core gate: assess whether a market is mispriced enough to act.
@@ -47,7 +64,7 @@ class MirrorGate:
     def __init__(self, kill_threshold: float = 1.5):
         self.kill_threshold = kill_threshold
 
-    def assess(self, taf_tx: float, market_threshold: float, market_prob: float) -> GateDecision:
+    def assess(self, taf_tx: float, market_threshold: float, market_prob: float, outcome_type: str = "above") -> GateDecision:
         """
         Assess whether a market is mispriced.
 
@@ -76,7 +93,7 @@ class MirrorGate:
             )
 
         # Probability-aware decision logic
-        action, detail, edge, model_prob, market_prob = self._decide_action(taf_tx, market_threshold, market_prob)
+        action, detail, edge, model_prob, market_prob = self._decide_action(taf_tx, market_threshold, market_prob, outcome_type)
         reason = f"{action} | {detail} | ΔT={diff:.1f}°"
 
         return GateDecision(
@@ -91,35 +108,22 @@ class MirrorGate:
             market_prob=market_prob,
         )
 
-    def _decide_action(self, taf_tx: float, market_threshold: float, market_prob: float) -> tuple[str, str, float, float, float]:
+    def _decide_action(self, taf_tx: float, market_threshold: float, market_prob: float, outcome_type: str) -> tuple[str, str, float, float, float]:
         """Probability-aware trading decisions."""
-        # Model probability: P(temp >= threshold) under Gaussian(TX, std=2°)
-        model_prob = prob_above(
-            mean=taf_tx,
-            std=2.0,
-            threshold=market_threshold,
-        )
+        model_prob = prob_below(mean=taf_tx, std=2.0, threshold=market_threshold) if outcome_type == "below" else prob_above(mean=taf_tx, std=2.0, threshold=market_threshold)
         edge = model_prob - market_prob
+        signal = decide_signal(model_prob, market_prob)
 
-        # --- SELL expensive YES (your main engine) ---
-        if market_prob > 0.95 and model_prob < 0.93:
-            return "SELL_NO", f"Overpriced YES: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}", edge, model_prob, market_prob
-
-        # --- BUY dirt cheap YES (lottery mode) ---
-        if market_prob < 0.02 and model_prob > 0.05:
-            return "BUY_YES", f"Underpriced YES: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}", edge, model_prob, market_prob
-
-        # --- LEAN signals (middle probability band - subtle directional edge) ---
-        # LEAN_YES: market underprices, model says temp likely exceeds threshold
-        if 0.15 <= market_prob <= 0.40 and model_prob > market_prob + 0.15:
-            return "LEAN_YES", f"Lean YES: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}", edge, model_prob, market_prob
-
-        # LEAN_NO: market overprices, model says temp likely below threshold
-        if 0.60 <= market_prob <= 0.85 and model_prob < market_prob - 0.15:
-            return "LEAN_NO", f"Lean NO: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}", edge, model_prob, market_prob
-
-        # --- MID VALUE ---
-        if 0.3 < market_prob < 0.7 and edge > 0.15:
-            return "MID VALUE", f"Mid-value: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}", edge, model_prob, market_prob
-
-        return "PASS", f"No edge: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}", edge, model_prob, market_prob
+        if signal == SignalType.SELL_NO:
+            detail = f"Overpriced YES: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}"
+        elif signal == SignalType.BUY_YES:
+            detail = f"Underpriced YES: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}"
+        elif signal == SignalType.LEAN_YES:
+            detail = f"Lean YES: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}"
+        elif signal == SignalType.LEAN_NO:
+            detail = f"Lean NO: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}"
+        elif signal == SignalType.MID_VALUE:
+            detail = f"Mid-value: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}"
+        else:
+            detail = f"No edge: mkt={market_prob:.3f}, model={model_prob:.3f}, edge={edge:.3f}"
+        return signal.value, detail, edge, model_prob, market_prob
