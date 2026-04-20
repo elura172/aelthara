@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
@@ -75,25 +75,60 @@ ICAO_TIMEZONES_FULL = {
     "SAEZ": "America/Argentina/Buenos_Aires",
 }
 
+SHORT_TERM_WINDOW_HOURS = 12
+SHORT_TERM_BASIC_1H_WEIGHT = 0.35
+SHORT_TERM_TAF_WEIGHT = 0.65
+# Weights intentionally sum to 1.0 (35% basic-1h + 65% TAF) for convex blending.
+TAF_MAX_CUTOFF_HOUR_LOCAL = 18
+LATE_DAY_CAP_HOUR_LOCAL = 16
+LATE_DAY_CAP_BUFFER_C = 1.5
+LOCAL_HOUR_TOLERANCE = 2
+DEFAULT_PREDICTABILITY = 80
+
+SHORT_TERM_PREDICTABILITY_HIGH = 80
+SHORT_TERM_PREDICTABILITY_MEDIUM = 60
+LONG_TERM_PREDICTABILITY_HIGH = 70
+LONG_TERM_PREDICTABILITY_MEDIUM = 50
+
+SIGMA_TIGHT = 1.5
+SIGMA_NORMAL = 2.0
+SIGMA_MEDIUM = 2.5
+SIGMA_WIDE = 3.0
+
+END_OF_DAY_RESOLUTION_HOUR = 23
+END_OF_DAY_RESOLUTION_MINUTE = 59
+
 
 def calculate_hours_to_resolution(resolution_time: datetime) -> int:
     """Calculate hours from now until market resolution."""
-    if resolution_time.tzinfo is None:
-        resolution_time = resolution_time.replace(tzinfo=timezone.utc)
+    resolution_time_utc = (
+        resolution_time.replace(tzinfo=timezone.utc)
+        if resolution_time.tzinfo is None
+        else resolution_time.astimezone(timezone.utc)
+    )
     now = datetime.now(timezone.utc)
-    delta = resolution_time.astimezone(timezone.utc) - now
+    delta = resolution_time_utc - now
     return int(delta.total_seconds() // 3600)
 
 
 def get_taf_max_remaining(taf_data: dict, airport_tz: str, current_local_hour: int) -> Optional[float]:
     """Get TAF-predicted max temperature for remaining hours of the day."""
-    del airport_tz  # reserved for future richer hour conversion
+    try:
+        tz = ZoneInfo(airport_tz)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("UTC")
+    derived_local_hour = datetime.now(timezone.utc).astimezone(tz).hour
+    # Keep caller-provided hour unless it is likely stale or mismatched (DST/local clock drift).
+    if abs(current_local_hour - derived_local_hour) <= LOCAL_HOUR_TOLERANCE:
+        effective_local_hour = current_local_hour
+    else:
+        effective_local_hour = derived_local_hour
     raw_taf = taf_data.get("rawTAF", "")
     tx_match = re.search(r"TX(M?)(\d+)/(\d{2})(\d{2})Z", raw_taf)
     if tx_match:
         sign = -1.0 if tx_match.group(1) == "M" else 1.0
         temp = sign * float(tx_match.group(2))
-        if current_local_hour < 18:
+        if effective_local_hour < TAF_MAX_CUTOFF_HOUR_LOCAL:
             return temp
     return None
 
@@ -109,7 +144,7 @@ def get_daily_peak_from_basic_1h(
     data_1h = meteoblue_data.get("data_1h", {})
     hourly_times = data_1h.get("time", [])
     hourly_temps = data_1h.get("temperature", [])
-    predictability = data_1h.get("predictability", 80)
+    predictability = data_1h.get("predictability", DEFAULT_PREDICTABILITY)
 
     if not hourly_times or not hourly_temps:
         return None
@@ -134,14 +169,17 @@ def get_daily_peak_from_basic_1h(
 
     raw_peak = max(day_temps)
 
-    if hours_to_resolution <= 12:
-        blended_peak = raw_peak * 0.35 + taf_max_remaining * 0.65 if taf_max_remaining is not None else raw_peak
-        if predictability >= 80:
-            sigma_adjust = 1.5
-        elif predictability >= 60:
-            sigma_adjust = 2.0
+    if hours_to_resolution <= SHORT_TERM_WINDOW_HOURS:
+        blended_peak = (
+            raw_peak * SHORT_TERM_BASIC_1H_WEIGHT + taf_max_remaining * SHORT_TERM_TAF_WEIGHT
+            if taf_max_remaining is not None else raw_peak
+        )
+        if predictability >= SHORT_TERM_PREDICTABILITY_HIGH:
+            sigma_adjust = SIGMA_TIGHT
+        elif predictability >= SHORT_TERM_PREDICTABILITY_MEDIUM:
+            sigma_adjust = SIGMA_NORMAL
         else:
-            sigma_adjust = 2.5
+            sigma_adjust = SIGMA_MEDIUM
         return {
             "peak_c": round(blended_peak, 1),
             "sigma_c": sigma_adjust,
@@ -150,12 +188,13 @@ def get_daily_peak_from_basic_1h(
             "reason": f"basic-1h nowcast + TAF blend (hours left: {hours_to_resolution}, predictability: {predictability}%)",
         }
 
-    if predictability >= 70:
-        sigma_adjust = 2.0
-    elif predictability >= 50:
-        sigma_adjust = 2.5
+    # Long-horizon thresholds are intentionally looser than short-term nowcast thresholds.
+    if predictability >= LONG_TERM_PREDICTABILITY_HIGH:
+        sigma_adjust = SIGMA_NORMAL
+    elif predictability >= LONG_TERM_PREDICTABILITY_MEDIUM:
+        sigma_adjust = SIGMA_MEDIUM
     else:
-        sigma_adjust = 3.0
+        sigma_adjust = SIGMA_WIDE
     return {
         "peak_c": round(raw_peak, 1),
         "sigma_c": sigma_adjust,
@@ -167,8 +206,8 @@ def get_daily_peak_from_basic_1h(
 
 def apply_late_day_cap(peak_c: float, current_local_hour: int, taf_trend_c: Optional[float]) -> float:
     """Cap possible upside when peak has likely already occurred."""
-    if current_local_hour >= 16 and taf_trend_c is not None:
-        return min(peak_c, taf_trend_c + 1.5)
+    if current_local_hour >= LATE_DAY_CAP_HOUR_LOCAL and taf_trend_c is not None:
+        return min(peak_c, taf_trend_c + LATE_DAY_CAP_BUFFER_C)
     return peak_c
 
 
@@ -238,7 +277,15 @@ class Oracle:
         airport_tz = ICAO_TIMEZONES_FULL.get(self.icao, "UTC")
         now_local = datetime.now(ZoneInfo(airport_tz))
         resolution_date = now_local.strftime("%Y-%m-%d")
-        resolution_local = datetime(now_local.year, now_local.month, now_local.day, 23, 59, tzinfo=ZoneInfo(airport_tz))
+        # Daily high contracts are modeled as end-of-local-day resolution in this oracle path.
+        resolution_local = datetime(
+            now_local.year,
+            now_local.month,
+            now_local.day,
+            END_OF_DAY_RESOLUTION_HOUR,
+            END_OF_DAY_RESOLUTION_MINUTE,
+            tzinfo=ZoneInfo(airport_tz),
+        )
         hours_to_resolution = calculate_hours_to_resolution(resolution_local.astimezone(timezone.utc))
         taf_data = self._pull_taf_raw()
         taf_max_remaining = get_taf_max_remaining(taf_data, airport_tz, now_local.hour) if taf_data else None
@@ -260,7 +307,7 @@ class Oracle:
                 "peak_c": round(max(values), 1),
                 "sigma_c": self.STD_DEGREE_C,
                 "short_term_active": False,
-                "predictability": 80,
+                "predictability": DEFAULT_PREDICTABILITY,
                 "reason": "fallback hourly max",
             }
 
