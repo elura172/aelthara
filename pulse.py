@@ -68,12 +68,18 @@ ICAO_LIST = [
     "KJFK", "KLAX", "KORD", "KMIA", "KATL", "KSEA", "KDEN",
     "EGLL", "LFPG", "EDDF", "EHAM", "RJTT", "RKSS", "WSSS",
     "VHHH", "ZBAA", "ZSPD", "YSSY", "NZAA", "SBGR", "SAEZ",
+    "KDFW", "KIAH", "KPHX", "KLAS",
+    "LEMD", "LIRF", "EDDM", "EIDW",
+    "VTBS", "VABB", "VIDP", "RCTP",
 ]
 
 CITY_LIST = [
     "NEW YORK", "LOS ANGELES", "CHICAGO", "MIAMI", "ATLANTA", "SEATTLE", "DENVER",
     "LONDON", "PARIS", "FRANKFURT", "AMSTERDAM", "TOKYO", "SEOUL", "SINGAPORE",
     "HONG KONG", "BEIJING", "SHANGHAI", "SYDNEY", "AUCKLAND", "SAO PAULO", "BUENOS AIRES",
+    "DALLAS", "HOUSTON", "PHOENIX", "LAS VEGAS",
+    "MADRID", "ROME", "MUNICH", "DUBLIN",
+    "BANGKOK", "MUMBAI", "DELHI", "TAIPEI",
 ]
 
 LOCAL_COORDS = {
@@ -84,6 +90,10 @@ LOCAL_COORDS = {
     "RKSS": (37.4602, 126.4407), "WSSS": (1.3644, 103.9915), "VHHH": (22.3020, 114.1742),
     "ZBAA": (40.0801, 116.5970), "ZSPD": (31.1434, 121.8050), "YSSY": (-33.9461, 151.1772),
     "NZAA": (-37.0082, 174.7917), "SBGR": (-23.4356, -46.4731), "SAEZ": (-34.8222, -58.5358),
+    "KDFW": (32.8471, -96.8518), "KIAH": (29.9902, -95.3368), "KPHX": (33.4373, -112.0078),
+    "KLAS": (36.0840, -115.1537), "LEMD": (40.4983, -3.5676), "LIRF": (41.8003, 12.2389),
+    "EDDM": (48.3538, 11.7861), "EIDW": (53.4264, -6.2499), "VTBS": (13.6900, 100.7501),
+    "VABB": (19.0896, 72.8656), "VIDP": (28.5562, 77.1000), "RCTP": (25.0797, 121.2342),
 }
 
 NAME_TO_CODE = {
@@ -108,6 +118,8 @@ NAME_TO_CODE = {
     "DELHI": "VIDP", "BANGKOK": "VTBS", "OSAKA": "RJBB", "NAGOYA": "RJGG",
     "KYOTO": "RJOT", "FUKUOKA": "RJFF", "PERTH": "YPPH", "BRISBANE": "YBBN",
     "MELBOURNE": "YMML", "ADELAIDE": "YPAD", "CHRISTCHURCH": "NZCH",
+    "FORT WORTH": "KDFW", "DFW": "KDFW", "VEGAS": "KLAS", "ROMA": "LIRF",
+    "MUNCHEN": "EDDM", "BOMBAY": "VABB", "NEW DELHI": "VIDP",
 }
 
 CITY_OVERRIDES = {
@@ -160,12 +172,17 @@ def resolve_market_city(comment_text: str) -> Optional[str]:
     if "BOSTON" in s: return "BOSTON"
     if "PHILADELPHIA" in s: return "PHILADELPHIA"
     if "SAN DIEGO" in s: return "SAN DIEGO"
-    if "LAS VEGAS" in s: return "LAS VEGAS"
+    if "DALLAS" in s or "DFW" in s or "FORT WORTH" in s: return "DALLAS"
+    if "HOUSTON" in s: return "HOUSTON"
+    if "PHOENIX" in s: return "PHOENIX"
+    if "LAS VEGAS" in s or "VEGAS" in s: return "LAS VEGAS"
     if "CALGARY" in s: return "CALGARY"
     if "OTTAWA" in s: return "OTTAWA"
     if "DUBLIN" in s: return "DUBLIN"
     if "LISBON" in s: return "LISBON"
-    if "MUNICH" in s: return "MUNICH"
+    if "MADRID" in s: return "MADRID"
+    if "ROME" in s or "ROMA" in s: return "ROME"
+    if "MUNICH" in s or "MUNCHEN" in s: return "MUNICH"
     if "STOCKHOLM" in s: return "STOCKHOLM"
     if "OSLO" in s: return "OSLO"
     if "HELSINKI" in s: return "HELSINKI"
@@ -180,9 +197,10 @@ def resolve_market_city(comment_text: str) -> Optional[str]:
     if "GLASGOW" in s: return "GLASGOW"
     if "MANCHESTER" in s: return "MANCHESTER"
     if "EDINBURGH" in s: return "EDINBURGH"
-    if "MUMBAI" in s: return "MUMBAI"
-    if "DELHI" in s: return "DELHI"
+    if "MUMBAI" in s or "BOMBAY" in s: return "MUMBAI"
+    if "DELHI" in s or "NEW DELHI" in s: return "DELHI"
     if "BANGKOK" in s: return "BANGKOK"
+    if "TAIPEI" in s: return "TAIPEI"
     if "OSAKA" in s: return "OSAKA"
     if "NAGOYA" in s: return "NAGOYA"
     if "KYOTO" in s: return "KYOTO"
