@@ -46,7 +46,7 @@ class TAFReading:
     raw: str
     source: str = "meteoblue"  # "meteoblue", "taf", or "openmeteo"
     distribution: Dict[str, float] = field(default_factory=lambda: {"mean": 0.0, "std": 2.0})
-    predictability: Optional[float] = None
+    predictability: Optional[float] = None  # Meteoblue confidence score (0-100), if available
 
     @property
     def tx_fahrenheit(self) -> float:
@@ -66,6 +66,7 @@ class Oracle:
     METEOBLUE = "https://api.meteoblue.com/v1/forecast"
     OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
     STD_DEGREE_C: float = 2.0
+    DEFAULT_PREDICTABILITY: float = 80.0
 
     def __init__(self, icao: str):
         self.icao = icao.upper()
@@ -242,7 +243,8 @@ class Oracle:
             predictability: Meteoblue predictability (0-100%)
 
         Returns:
-            Sigma value for Gaussian distribution
+            Sigma value for Gaussian distribution using confidence tiers:
+            >=80 -> 1.5, >=70 -> 2.0, >=60 -> 2.5, else -> 3.0.
         """
         if predictability >= 80:
             return 1.5
@@ -263,11 +265,18 @@ class Oracle:
 
         predictability = data_1h.get("predictability")
         if isinstance(predictability, list):
-            predictability = sum(predictability) / len(predictability) if predictability else 80
-        elif predictability is None:
-            predictability = 80
+            numeric_values = [v for v in predictability if isinstance(v, (int, float))]
+            predictability = (
+                sum(numeric_values) / len(numeric_values)
+                if numeric_values
+                else self.DEFAULT_PREDICTABILITY
+            )
+        elif isinstance(predictability, (int, float)):
+            predictability = float(predictability)
+        else:
+            predictability = self.DEFAULT_PREDICTABILITY
 
-        sigma = self._calculate_sigma_from_predictability(float(predictability))
+        sigma = self._calculate_sigma_from_predictability(predictability)
         return {
             "peak_c": float(tx),
             "predictability": float(predictability),
