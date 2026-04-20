@@ -2,8 +2,11 @@
 Simple weather data from Meteoblue + TAF with Open-Meteo backup.
 """
 import httpx
+import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 class WeatherData:
@@ -52,21 +55,21 @@ class WeatherData:
                     'lat': lat, 'lon': lon,
                     'format': 'json',
                 },
-                timeout=10.0
+                timeout=12.0
             )
             r.raise_for_status()
             data = r.json()
             data_1h = data.get('data_1h', {})
             
             # Get current hour values
-            time_strs = data_1h.get('time', [])
-            if not time_strs:
+            times = data_1h.get('time', [])
+            if not times:
                 return None
 
             now = datetime.now(timezone.utc)
             idx = 0
             try:
-                timestamps = [datetime.fromisoformat(t.replace('Z', '+00:00')) for t in time_strs]
+                timestamps = [datetime.fromisoformat(t.replace('Z', '+00:00')) for t in times]
                 idx = min(range(len(timestamps)), key=lambda i: abs((timestamps[i] - now).total_seconds()))
             except (TypeError, ValueError):
                 idx = 0
@@ -80,7 +83,8 @@ class WeatherData:
                 'precipitation': precip[idx] if idx < len(precip) else 0,
                 'wind_speed': wind[idx] if idx < len(wind) else 0,
             }
-        except Exception:
+        except Exception as e:
+            logger.warning("Meteoblue weather fetch failed: %s", e)
             return None
     
     def _open_meteo(self, lat: float, lon: float) -> Optional[Dict]:
@@ -92,7 +96,7 @@ class WeatherData:
                     'latitude': lat, 'longitude': lon,
                     'current': 'temperature_2m,precipitation,wind_speed_10m'
                 },
-                timeout=10.0
+                timeout=12.0
             )
             r.raise_for_status()
             c = r.json().get('current', {})
@@ -101,7 +105,8 @@ class WeatherData:
                 'precipitation': c.get('precipitation'),
                 'wind_speed': c.get('wind_speed_10m'),
             }
-        except Exception:
+        except Exception as e:
+            logger.warning("Open-Meteo weather fetch failed: %s", e)
             return None
     
     def _taf(self, station: str) -> Optional[Dict]:
@@ -110,7 +115,7 @@ class WeatherData:
             r = httpx.get(
                 "https://aviationweather.gov/api/data/taf",
                 params={'ids': station, 'format': 'json'},
-                timeout=10.0
+                timeout=12.0
             )
             r.raise_for_status()
             data = r.json()
@@ -123,7 +128,8 @@ class WeatherData:
                 'visibility': t.get('vis'),
                 'raw': t.get('rawOb'),
             }
-        except Exception:
+        except Exception as e:
+            logger.warning("TAF weather fetch failed for %s: %s", station, e)
             return None
     
     def _merge(self, mb, om, taf) -> Dict:

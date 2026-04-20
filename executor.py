@@ -1,6 +1,7 @@
 """Executor — scans Polymarket for Impossible Rungs and places limit orders."""
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from typing import Optional
 import httpx
 
 from gate import GateDecision, to_distribution, prob_above, prob_below, prob_band
+
+logger = logging.getLogger(__name__)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
@@ -219,7 +222,8 @@ class Executor:
             )
             r.raise_for_status()
             return r.json() if isinstance(r.json(), list) else []
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to fetch markets for %s: %s", city, e)
             return []
 
     def _parse_threshold_celsius(self, question: str) -> Optional[float]:

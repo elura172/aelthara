@@ -34,6 +34,23 @@ def prob_below(mean: float, std: float, threshold: float) -> float:
     return norm.cdf(threshold, mean, std)
 
 
+def decide_signal(model_prob: float, market_prob: float) -> str:
+    """Centralized signal decision logic."""
+    edge = model_prob - market_prob
+
+    if market_prob > 0.95 and model_prob < 0.93:
+        return "SELL_NO"
+    if market_prob < 0.02 and model_prob > 0.05:
+        return "BUY_YES"
+    if 0.15 <= market_prob <= 0.40 and model_prob > market_prob + 0.15:
+        return "LEAN_YES"
+    if 0.60 <= market_prob <= 0.85 and model_prob < market_prob - 0.15:
+        return "LEAN_NO"
+    if 0.3 < market_prob < 0.7 and edge > 0.15:
+        return "MID_VALUE"
+    return "PASS"
+
+
 class MirrorGate:
     """
     Core gate: assess whether a market is mispriced enough to act.
