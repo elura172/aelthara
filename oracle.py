@@ -2,14 +2,17 @@
 
 import os
 import re
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 # ICAO to coordinates mapping
 ICAO_COORDS = {
@@ -51,6 +54,110 @@ ICAO_TIMEZONES_FULL = {
 }
 
 
+def get_daily_peak_from_basic_1h(
+    meteoblue_data: dict,
+    market_resolution_date: str,
+    airport_tz: str,
+    hours_to_resolution: int,
+    taf_max_remaining: float | None = None,
+) -> dict | None:
+    """Extract daily max from hourly data with short-term nowcast weighting."""
+    data_1h = meteoblue_data.get("data_1h", {})
+    hourly_times = data_1h.get("time", [])
+    hourly_temps = data_1h.get("temperature", [])
+
+    predictability = data_1h.get("predictability")
+    if isinstance(predictability, list):
+        numeric_vals = [v for v in predictability if isinstance(v, (int, float))]
+        predictability = sum(numeric_vals) / len(numeric_vals) if numeric_vals else 80
+    elif predictability is None or not isinstance(predictability, (int, float)):
+        predictability = 80
+
+    if not hourly_times or not hourly_temps:
+        return None
+
+    resolution_day = datetime.strptime(market_resolution_date, "%Y-%m-%d").date()
+    tz = ZoneInfo(airport_tz)
+
+    day_temps = []
+    for t_str, temp in zip(hourly_times, hourly_temps):
+        t_str_clean = t_str.replace("Z", "+00:00")
+        if "+" not in t_str_clean and "-" not in t_str_clean[10:]:
+            dt = datetime.fromisoformat(t_str_clean).replace(tzinfo=ZoneInfo("UTC"))
+        else:
+            dt = datetime.fromisoformat(t_str_clean)
+
+        local_dt = dt.astimezone(tz)
+        if local_dt.date() == resolution_day:
+            day_temps.append(temp)
+
+    if not day_temps:
+        return None
+
+    raw_peak = max(day_temps)
+
+    if hours_to_resolution <= 12:
+        if taf_max_remaining is not None:
+            blended_peak = raw_peak * 0.35 + taf_max_remaining * 0.65
+        else:
+            blended_peak = raw_peak
+
+        if predictability >= 80:
+            sigma_adjust = 1.5
+        elif predictability >= 60:
+            sigma_adjust = 2.0
+        else:
+            sigma_adjust = 2.5
+
+        return {
+            "peak_c": round(blended_peak, 1),
+            "sigma_c": sigma_adjust,
+            "short_term_active": True,
+            "predictability": predictability,
+            "reason": f"basic-1h nowcast + TAF blend (hours left: {hours_to_resolution}, predictability: {predictability}%)",
+        }
+
+    if predictability >= 70:
+        sigma_adjust = 2.0
+    elif predictability >= 50:
+        sigma_adjust = 2.5
+    else:
+        sigma_adjust = 3.0
+
+    return {
+        "peak_c": round(raw_peak, 1),
+        "sigma_c": sigma_adjust,
+        "short_term_active": False,
+        "predictability": predictability,
+        "reason": f"basic-1h hourly max (longer horizon, predictability: {predictability}%)",
+    }
+
+
+def get_taf_max_remaining(taf_raw: str, current_local_hour: int) -> float | None:
+    """Extract TAF max temp if still relevant for remaining day."""
+    m = re.search(r"TX(M?)(\d+)/(\d{2})(\d{2})Z", taf_raw)
+    if not m:
+        return None
+    temp = (-1.0 if m.group(1) == "M" else 1.0) * float(m.group(2))
+    taf_hour = int(m.group(4))
+    if taf_hour > current_local_hour:
+        return temp
+    return None
+
+
+def calculate_hours_to_resolution(resolution_time: datetime) -> int:
+    """Calculate hours until market resolution."""
+    delta = resolution_time - datetime.now(timezone.utc)
+    return max(0, int(delta.total_seconds() / 3600))
+
+
+def apply_late_day_cap(peak_c: float, current_local_hour: int, taf_max: float | None) -> float:
+    """Cap upside after 4pm local when daily peak is likely set."""
+    if current_local_hour >= 16 and taf_max is not None:
+        return min(peak_c, taf_max + 1.5)
+    return peak_c
+
+
 @dataclass
 class TAFReading:
     icao: str
@@ -59,6 +166,7 @@ class TAFReading:
     raw: str
     source: str = "meteoblue"  # "meteoblue", "taf", or "openmeteo"
     distribution: Dict[str, float] = field(default_factory=lambda: {"mean": 0.0, "std": 2.0})
+    predictability: Optional[float] = None
 
     @property
     def tx_fahrenheit(self) -> float:
@@ -92,7 +200,7 @@ class Oracle:
             if reading:
                 return reading
         except Exception as e:
-            print(f"[Oracle] Meteoblue failed for {self.icao}: {e}")
+            logger.warning("Meteoblue failed for %s: %s", self.icao, e)
 
         # Try TAF
         try:
@@ -100,7 +208,7 @@ class Oracle:
             if reading:
                 return reading
         except Exception as e:
-            print(f"[Oracle] TAF failed for {self.icao}: {e}")
+            logger.warning("TAF failed for %s: %s", self.icao, e)
 
         # Fallback to Open-Meteo
         try:
@@ -131,23 +239,31 @@ class Oracle:
         )
         r.raise_for_status()
         data = r.json()
-        temp_data = data.get("data_1h", {})
-        values = temp_data.get("temperature", [])
+        data_1h = data.get("data_1h", {})
+        values = data_1h.get("temperature", [])
 
         if not values:
             return None
 
-        # Get max from hourly values
+        predictability = data_1h.get("predictability")
+        if isinstance(predictability, list):
+            numeric_vals = [v for v in predictability if isinstance(v, (int, float))]
+            predictability = sum(numeric_vals) / len(numeric_vals) if numeric_vals else 80.0
+        elif not isinstance(predictability, (int, float)):
+            predictability = 80.0
+
         tx = max(values)
-        dist = self.to_distribution(tx)
+        sigma = self._calculate_sigma(predictability)
+        dist = {"mean": float(tx), "std": sigma}
 
         return TAFReading(
             icao=self.icao,
             tx_celsius=tx,
             issued_at=datetime.now(timezone.utc).isoformat(),
-            raw="Meteoblue daily max",
+            raw=f"Meteoblue daily max (predictability: {predictability:.0f}%)",
             source="meteoblue",
             distribution=dist,
+            predictability=predictability,
         )
 
     def _pull_taf(self) -> Optional[TAFReading]:
@@ -227,6 +343,81 @@ class Oracle:
         if changed:
             self._last_issued = reading.issued_at
         return changed
+
+    def _calculate_sigma(self, predictability: float | None) -> float:
+        """Calculate Gaussian σ based on predictability."""
+        if predictability is None:
+            return 2.0
+        if predictability >= 80:
+            return 1.5
+        if predictability >= 70:
+            return 2.0
+        if predictability >= 60:
+            return 2.5
+        return 3.0
+
+    def generate_signal(
+        self,
+        market_question: str,
+        market_price_cents: int,
+        resolution_time: datetime,
+        threshold_celsius: float,
+        outcome_type: str = "above",
+    ) -> "OracleSignal":
+        """Generate a full structured trading signal."""
+        from signal import OracleSignal, SignalType
+        from gate import decide_signal, prob_above, prob_below
+
+        reading = self.pull()
+        hours_to_resolution = calculate_hours_to_resolution(resolution_time)
+
+        predictability = getattr(reading, "predictability", None)
+        sigma = self._calculate_sigma(predictability)
+
+        if outcome_type == "below":
+            model_prob = prob_below(reading.tx_celsius, sigma, threshold_celsius)
+        else:
+            model_prob = prob_above(reading.tx_celsius, sigma, threshold_celsius)
+
+        market_prob = market_price_cents / 100.0
+        edge = int((model_prob - market_prob) * 100)
+
+        confidence = self._calculate_confidence(predictability, hours_to_resolution)
+        signal_type = decide_signal(model_prob, market_prob)
+        kelly = self._calculate_kelly(model_prob, market_prob)
+
+        return OracleSignal(
+            market=market_question,
+            model_mean_c=reading.tx_celsius,
+            model_prob=model_prob,
+            market_price=market_price_cents,
+            edge=edge,
+            confidence=confidence,
+            signal=SignalType(signal_type),
+            reason=f"{reading.source} forecast: {reading.tx_celsius:.1f}°C",
+            kelly_fraction=kelly,
+        )
+
+    def _calculate_confidence(self, predictability: float | None, hours_to_resolution: int) -> "Confidence":
+        from signal import Confidence
+
+        if hours_to_resolution <= 12:
+            return Confidence.HIGH
+        if predictability is None:
+            return Confidence.MEDIUM
+        if predictability >= 70:
+            return Confidence.HIGH
+        if predictability >= 50:
+            return Confidence.MEDIUM
+        return Confidence.LOW
+
+    def _calculate_kelly(self, model_prob: float, market_prob: float) -> float:
+        """Calculate Kelly fraction, capped at 5%."""
+        if model_prob <= market_prob:
+            return 0.0
+        edge = model_prob - market_prob
+        kelly = edge / (1 - market_prob) if market_prob < 1 else 0
+        return min(kelly, 0.05)
 
     def to_distribution(self, tx_celsius: float) -> Dict[str, float]:
         return {"mean": float(tx_celsius), "std": self.STD_DEGREE_C}
