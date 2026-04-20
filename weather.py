@@ -68,7 +68,7 @@ class WeatherData:
             try:
                 timestamps = [datetime.fromisoformat(t.replace('Z', '+00:00')) for t in time_strs]
                 idx = min(range(len(timestamps)), key=lambda i: abs((timestamps[i] - now).total_seconds()))
-            except Exception:
+            except (TypeError, ValueError):
                 idx = 0
 
             temps = data_1h.get('temperature', [])
