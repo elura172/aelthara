@@ -5,12 +5,16 @@ and matches them to ICAO cities for TAF ↔ Market comparison.
 """
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
 import httpx
+from utils import retry_async_request
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -128,7 +132,8 @@ class MarketScraper:
             )
             self._markets = [self._parse_m(m) for m in r if m.get("acceptingOrders") and not m.get("closed")]
             return self._markets
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to fetch markets: {e}")
             return []
 
     def _parse_m(self, raw: dict) -> Optional[Market]:
@@ -171,10 +176,14 @@ class MarketScraper:
 
     async def _aget(self, url: str, params: dict) -> list:
         async with httpx.AsyncClient(timeout=12.0) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-            return data if isinstance(data, list) else []
+            try:
+                r = await retry_async_request(lambda: client.get(url, params=params))
+                r.raise_for_status()
+                data = r.json()
+                return data if isinstance(data, list) else []
+            except Exception as e:
+                logger.warning(f"Failed request to {url}: {e}")
+                return []
 
     def match_to_city(self, market: Market, city: str) -> bool:
         """Match market city to target city with alias support."""

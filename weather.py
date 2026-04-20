@@ -1,9 +1,13 @@
 """
 Simple weather data from Meteoblue + TAF with Open-Meteo backup.
 """
+import logging
 import httpx
 from datetime import datetime
 from typing import Optional, Dict, Any
+from utils import retry_request
+
+logger = logging.getLogger(__name__)
 
 
 class WeatherData:
@@ -45,16 +49,18 @@ class WeatherData:
     def _meteoblue(self, lat: float, lon: float) -> Optional[Dict]:
         """Fetch from Meteoblue."""
         try:
-            r = httpx.get(
-                "https://api.meteoblue.com/v1/forecast",
-                params={
-                    'apikey': self.meteoblue_key,
-                    'lat': lat, 'lon': lon,
-                    'format': 'json',
-                    'products': ['temperature_2m', 'precipitation', 'wind_speed_10m'],
-                    'forecast_days': 1
-                },
-                timeout=10.0
+            r = retry_request(
+                lambda: httpx.get(
+                    "https://api.meteoblue.com/v1/forecast",
+                    params={
+                        'apikey': self.meteoblue_key,
+                        'lat': lat, 'lon': lon,
+                        'format': 'json',
+                        'products': ['temperature_2m', 'precipitation', 'wind_speed_10m'],
+                        'forecast_days': 1
+                    },
+                    timeout=12.0
+                )
             )
             r.raise_for_status()
             data = r.json().get('data', {})
@@ -62,6 +68,8 @@ class WeatherData:
             # Get current hour values
             now = int(datetime.now().timestamp())
             times = data.get('temperature_2m', {}).get('time', [])
+            if not times:
+                return None
             idx = min(range(len(times)), key=lambda i: abs(times[i] - now))
             
             return {
@@ -69,19 +77,22 @@ class WeatherData:
                 'precipitation': data.get('precipitation', {}).get('values', [0]*len(times))[idx],
                 'wind_speed': data.get('wind_speed_10m', {}).get('values', [0]*len(times))[idx],
             }
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Meteoblue API failed: {e}")
             return None
     
     def _open_meteo(self, lat: float, lon: float) -> Optional[Dict]:
         """Fetch from Open-Meteo (backup)."""
         try:
-            r = httpx.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    'latitude': lat, 'longitude': lon,
-                    'current': 'temperature_2m,precipitation,wind_speed_10m'
-                },
-                timeout=10.0
+            r = retry_request(
+                lambda: httpx.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        'latitude': lat, 'longitude': lon,
+                        'current': 'temperature_2m,precipitation,wind_speed_10m'
+                    },
+                    timeout=12.0
+                )
             )
             r.raise_for_status()
             c = r.json().get('current', {})
@@ -90,16 +101,19 @@ class WeatherData:
                 'precipitation': c.get('precipitation'),
                 'wind_speed': c.get('wind_speed_10m'),
             }
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Open-Meteo API failed: {e}")
             return None
     
     def _taf(self, station: str) -> Optional[Dict]:
         """Fetch TAF data."""
         try:
-            r = httpx.get(
-                "https://aviationweather.gov/api/data/taf",
-                params={'ids': station, 'format': 'json'},
-                timeout=10.0
+            r = retry_request(
+                lambda: httpx.get(
+                    "https://aviationweather.gov/api/data/taf",
+                    params={'ids': station, 'format': 'json'},
+                    timeout=12.0
+                )
             )
             r.raise_for_status()
             data = r.json()
@@ -112,7 +126,8 @@ class WeatherData:
                 'visibility': t.get('vis'),
                 'raw': t.get('rawOb'),
             }
-        except Exception:
+        except Exception as e:
+            logger.warning(f"TAF API failed: {e}")
             return None
     
     def _merge(self, mb, om, taf) -> Dict:
@@ -137,19 +152,19 @@ class WeatherData:
                 result['sources'].append('open_meteo')
         
         # Wind: TAF → Meteoblue → Open-Meteo
-        if tafand taf.get('wind_speed'):
+        if taf and taf.get('wind_speed'):
             result['wind_speed'] = taf['wind_speed']
             result['wind_dir'] = taf.get('wind_dir')
             result['sources'].append('taf')
         elif mb and mb.get('wind_speed'):
             result['wind_speed'] = mb['wind_speed']
             result['sources'].append('meteoblue')
-        elif omand om.get('wind_speed'):
+        elif om and om.get('wind_speed'):
             result['wind_speed'] = om['wind_speed']
             result['sources'].append('open_meteo')
         
         # Visibility from TAF only
-        if tafand taf.get('visibility'):
+        if taf and taf.get('visibility'):
             result['visibility'] = taf['visibility']
             result['sources'].append('taf')
         

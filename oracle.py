@@ -2,14 +2,17 @@
 
 import os
 import re
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
 import httpx
 from dotenv import load_dotenv
+from utils import retry_request
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 # ICAO to coordinates mapping
 ICAO_COORDS = {
@@ -79,7 +82,7 @@ class Oracle:
             if reading:
                 return reading
         except Exception as e:
-            print(f"[Oracle] Meteoblue failed for {self.icao}: {e}")
+            logger.warning(f"Meteoblue failed for {self.icao}: {e}")
 
         # Try TAF
         try:
@@ -87,7 +90,7 @@ class Oracle:
             if reading:
                 return reading
         except Exception as e:
-            print(f"[Oracle] TAF failed for {self.icao}: {e}")
+            logger.warning(f"TAF failed for {self.icao}: {e}")
 
         # Fallback to Open-Meteo
         try:
@@ -106,17 +109,19 @@ class Oracle:
 
         lat, lon = coords
 
-        r = httpx.get(
-            self.METEOBLUE,
-            params={
-                "apikey": self._meteoblue_key,
-                "lat": lat,
-                "lon": lon,
-                "format": "json",
-                "products": ["temperature_2m"],
-                "forecast_days": 1,
-            },
-            timeout=12,
+        r = retry_request(
+            lambda: httpx.get(
+                self.METEOBLUE,
+                params={
+                    "apikey": self._meteoblue_key,
+                    "lat": lat,
+                    "lon": lon,
+                    "format": "json",
+                    "products": ["temperature_2m"],
+                    "forecast_days": 1,
+                },
+                timeout=12,
+            )
         )
         r.raise_for_status()
         data = r.json().get("data", {})
@@ -142,10 +147,12 @@ class Oracle:
 
     def _pull_taf(self) -> Optional[TAFReading]:
         """Get TX from TAF."""
-        r = httpx.get(
-            self.AWC,
-            params={"ids": self.icao, "format": "json"},
-            timeout=12,
+        r = retry_request(
+            lambda: httpx.get(
+                self.AWC,
+                params={"ids": self.icao, "format": "json"},
+                timeout=12,
+            )
         )
         r.raise_for_status()
         data = r.json()
@@ -179,17 +186,19 @@ class Oracle:
         lat, lon = coords
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        r = httpx.get(
-            self.OPEN_METEO,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "daily": "temperature_2m_max",
-                "start_date": today,
-                "end_date": today,
-                "timezone": "auto",
-            },
-            timeout=12,
+        r = retry_request(
+            lambda: httpx.get(
+                self.OPEN_METEO,
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "daily": "temperature_2m_max",
+                    "start_date": today,
+                    "end_date": today,
+                    "timezone": "auto",
+                },
+                timeout=12,
+            )
         )
         r.raise_for_status()
         data = r.json()

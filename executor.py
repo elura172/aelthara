@@ -1,6 +1,7 @@
 """Executor — scans Polymarket for Impossible Rungs and places limit orders."""
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from typing import Optional
 import httpx
 
 from gate import GateDecision, to_distribution, prob_above, prob_below, prob_band
+from utils import retry_request
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
@@ -18,6 +20,7 @@ KELLY_FRACTION = 0.10
 MAX_ORDER = 5.0
 MIN_ORDER = 1.0
 DRY_RUN = os.environ.get("MIRROR_DRY_RUN", "true").lower() != "false"
+logger = logging.getLogger(__name__)
 
 # Timezone offsets for major airports (hours from UTC)
 ICAO_TIMEZONES = {
@@ -211,14 +214,17 @@ class Executor:
 
     def _fetch_markets(self, city: str) -> list[dict]:
         try:
-            r = httpx.get(
-                f"{GAMMA_BASE}/markets",
-                params={"keyword": f"{city} temperature", "closed": "false", "limit": 50},
-                timeout=12,
+            r = retry_request(
+                lambda: httpx.get(
+                    f"{GAMMA_BASE}/markets",
+                    params={"keyword": f"{city} temperature", "closed": "false", "limit": 50},
+                    timeout=12,
+                )
             )
             r.raise_for_status()
             return r.json() if isinstance(r.json(), list) else []
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to fetch markets for {city}: {e}")
             return []
 
     def _parse_threshold_celsius(self, question: str) -> Optional[float]:
