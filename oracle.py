@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -46,6 +46,7 @@ class TAFReading:
     raw: str
     source: str = "meteoblue"  # "meteoblue", "taf", or "openmeteo"
     distribution: Dict[str, float] = field(default_factory=lambda: {"mean": 0.0, "std": 2.0})
+    predictability: Optional[float] = None
 
     @property
     def tx_fahrenheit(self) -> float:
@@ -119,25 +120,34 @@ class Oracle:
             timeout=12,
         )
         r.raise_for_status()
-        data = r.json().get("data", {})
+        meteoblue_data = r.json()
 
-        temp_data = data.get("temperature_2m", {})
-        values = temp_data.get("values", [])
+        peak_info = get_daily_peak_from_basic_1h(meteoblue_data)
+        if peak_info:
+            tx = peak_info["peak_c"]
+            predictability = peak_info["predictability"]
+            sigma = self._calculate_sigma_from_predictability(predictability)
+        else:
+            # Backward compatibility for older payload structure
+            data = meteoblue_data.get("data", {})
+            temp_data = data.get("temperature_2m", {})
+            values = temp_data.get("values", [])
+            if not values:
+                return None
+            tx = float(max(values))
+            predictability = 80.0
+            sigma = self._calculate_sigma_from_predictability(predictability)
 
-        if not values:
-            return None
-
-        # Get max from hourly values
-        tx = max(values)
-        dist = self.to_distribution(tx)
+        dist = {"mean": float(tx), "std": sigma}
 
         return TAFReading(
             icao=self.icao,
             tx_celsius=tx,
             issued_at=datetime.now(timezone.utc).isoformat(),
-            raw="Meteoblue daily max",
+            raw=f"Meteoblue daily max (predictability: {predictability:.0f}%)",
             source="meteoblue",
             distribution=dist,
+            predictability=predictability,
         )
 
     def _pull_taf(self) -> Optional[TAFReading]:
@@ -221,8 +231,70 @@ class Oracle:
     def to_distribution(self, tx_celsius: float) -> Dict[str, float]:
         return {"mean": float(tx_celsius), "std": self.STD_DEGREE_C}
 
+    def _calculate_sigma_from_predictability(self, predictability: float) -> float:
+        """Calculate Gaussian σ from Meteoblue predictability (0-100)."""
+        if predictability >= 80:
+            return 1.5
+        if predictability >= 70:
+            return 2.0
+        if predictability >= 60:
+            return 2.5
+        return 3.0
+
     def _parse_tx(self, raw: str) -> float:
         m = re.search(r"TX(M?)(\d+)/", raw)
         if not m:
             raise ValueError(f"No TX group found in TAF for {self.icao}")
         return (-1.0 if m.group(1) == "M" else 1.0) * float(m.group(2))
+
+
+def get_daily_peak_from_basic_1h(meteoblue_data: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Extract daily peak and predictability-adjusted sigma from basic-1h data."""
+    data_1h = meteoblue_data.get("data_1h", {})
+    hourly_temps = data_1h.get("temperature", [])
+    if not hourly_temps:
+        return None
+
+    numeric_temps = []
+    for temp in hourly_temps:
+        try:
+            numeric_temps.append(float(temp))
+        except (TypeError, ValueError):
+            continue
+
+    if not numeric_temps:
+        return None
+
+    predictability_data = data_1h.get("predictability")
+    if isinstance(predictability_data, list):
+        predictability_values = []
+        for value in predictability_data:
+            try:
+                predictability_values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        predictability = (
+            sum(predictability_values) / len(predictability_values) if predictability_values else 80.0
+        )
+    elif predictability_data is None:
+        predictability = 80.0
+    else:
+        try:
+            predictability = float(predictability_data)
+        except (TypeError, ValueError):
+            predictability = 80.0
+
+    if predictability >= 80:
+        sigma = 1.5
+    elif predictability >= 70:
+        sigma = 2.0
+    elif predictability >= 60:
+        sigma = 2.5
+    else:
+        sigma = 3.0
+
+    return {
+        "peak_c": float(max(numeric_temps)),
+        "sigma_c": sigma,
+        "predictability": float(predictability),
+    }
