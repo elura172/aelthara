@@ -71,10 +71,12 @@ ssh-keygen -t ed25519 -f ~/.ssh/aelthara_deploy -N ""
 # Add to repo: Settings → Deploy Keys → Add deploy key
 
 # Configure SSH
-echo "Host github-aelthara
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/aelthara_deploy" >> ~/.ssh/config
+nano ~/.ssh/config
+# Add:
+# Host github-aelthara
+#     HostName github.com
+#     User git
+#     IdentityFile ~/.ssh/aelthara_deploy
 
 # Clone
 git clone github-aelthara:elura172/aelthara.git
