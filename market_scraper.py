@@ -113,17 +113,17 @@ CITY_ALIASES = {
 class MarketScraper:
     """Fetches and parses Polymarket temperature markets."""
 
-    CLOB_BASE = "https://clob.polymarket.com"
+    GAMMA_BASE = "https://gamma-api.polymarket.com"
 
     def __init__(self):
         self._markets: List[Market] = []
 
     async def fetch_markets(self, keywords: str = "temperature", limit: int = 50) -> List[Market]:
-        """Pull active scalar/band markets from Polymarket CLOB."""
+        """Pull active scalar/band markets from Polymarket Gamma API."""
         try:
             r = await self._aget(
-                f"{self.CLOB_BASE}/markets",
-                params={"keyword": keywords, "limit": limit, "closed": "false"},
+                f"{self.GAMMA_BASE}/markets",
+                params={"q": keywords, "limit": limit, "closed": "false"},
             )
             self._markets = [self._parse_m(m) for m in r if m.get("acceptingOrders") and not m.get("closed")]
             return self._markets
