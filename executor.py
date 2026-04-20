@@ -121,11 +121,11 @@ class Executor:
             # For <= markets: YES means "at or below" the threshold
             # For >= markets: YES means "at or above" the threshold
             if outcome_type == "below":
-                # If threshold <= TX, likely YES (high will be at/below threshold)
-                taf_side = "YES" if threshold <= taf_tx_celsius else "NO"
+                # For <= markets: YES if forecast is at/below threshold
+                taf_side = "YES" if taf_tx_celsius <= threshold else "NO"
             else:
-                # If threshold <= TX, likely YES (high will be at/above threshold)
-                taf_side = "YES" if threshold <= taf_tx_celsius else "NO"
+                # For >= markets: YES if forecast is at/above threshold
+                taf_side = "YES" if taf_tx_celsius >= threshold else "NO"
 
             side_idx = 0 if outcomes[0].lower().startswith("y") else 1
             if taf_side == "NO":
