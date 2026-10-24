@@ -1,2 +1,24 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Secrets & Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# OS artifacts
+.DS_Store
+Thumbs.db

@@ -3,27 +3,45 @@
 import asyncio
 import logging
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
-from rich.console import Console
-from rich.style import Style
-
+from config import ICAO_LIST, CITY_LIST, CITY_TO_ICAO, get_coords
 from gate import MirrorGate, GateDecision
 from executor import Executor
-from market_scraper import MarketScraper
 from oracle import Oracle
+from position_shaper import (
+    should_trade_market,
+    get_market_template,
+    calculate_position_sizing,
+    is_ui_pin_opportunity,
+    calculate_pin_short_size,
+)
+from mirror_field import compute_mirror_field
+from mirror_field_node import MirrorFieldNode
+from mirror_field_mesh import MirrorFieldMesh
+from telegram_relay import (
+    send_telegram_message,
+    format_trade_alert,
+    format_signal_alert,
+    format_error_alert,
+)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-BANKROLL = 100000.0          # $100,000 starting capital
-TAF_INTERVAL_HOURS = 6      # Refresh TAF every 6 hours
-PRICE_POLL_MINUTES = 15      # Poll markets every 15 minutes
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BANKROLL_STATIC = float(os.getenv("AELTHARA_BANKROLL", "3.65"))
+USE_LIVE_BANKROLL = os.getenv("MIRROR_LIVE_BANKROLL", "false").lower() == "true"
+TAF_INTERVAL_HOURS = 3      # Refresh TAF every 3 hours
+PRICE_POLL_MINUTES = 15    # Poll markets every 15 minutes
 LOG_MAX_BYTES = 10_000_000   # 10MB per log file
 LOG_BACKUP_COUNT = 5        # Keep 5 backup files
-
-console = Console()
 
 # ── Logging Setup ──────────────────────────────────────────────────────────────
 
@@ -62,77 +80,7 @@ def setup_logging(name: str = "pulse") -> logging.Logger:
 
 logger = setup_logging("pulse")
 
-# ── Airport Data ───────────────────────────────────────────────────────────────
-
-ICAO_LIST = [
-    "KJFK", "KLAX", "KORD", "KMIA", "KATL", "KSEA", "KDEN",
-    "EGLL", "LFPG", "EDDF", "EHAM", "RJTT", "RKSS", "WSSS",
-    "VHHH", "ZBAA", "ZSPD", "YSSY", "NZAA", "SBGR", "SAEZ",
-    "KDFW", "KIAH", "KPHX", "KLAS",
-    "LEMD", "LIRF", "EDDM", "EIDW",
-    "VTBS", "VABB", "VIDP", "RCTP",
-]
-
-CITY_LIST = [
-    "NEW YORK", "LOS ANGELES", "CHICAGO", "MIAMI", "ATLANTA", "SEATTLE", "DENVER",
-    "LONDON", "PARIS", "FRANKFURT", "AMSTERDAM", "TOKYO", "SEOUL", "SINGAPORE",
-    "HONG KONG", "BEIJING", "SHANGHAI", "SYDNEY", "AUCKLAND", "SAO PAULO", "BUENOS AIRES",
-    "DALLAS", "HOUSTON", "PHOENIX", "LAS VEGAS",
-    "MADRID", "ROME", "MUNICH", "DUBLIN",
-    "BANGKOK", "MUMBAI", "DELHI", "TAIPEI",
-]
-
-LOCAL_COORDS = {
-    "KJFK": (40.6413, -73.7781), "KLAX": (33.9416, -118.4085), "KORD": (41.9742, -87.9073),
-    "KMIA": (25.7959, -80.2870), "KATL": (33.6407, -84.4277), "KSEA": (47.4502, -122.3088),
-    "KDEN": (39.7017, -104.7516), "EGLL": (51.4700, -0.4543), "LFPG": (49.0097, 2.5479),
-    "EDDF": (50.0379, 8.5622), "EHAM": (52.3105, 4.7683), "RJTT": (35.7720, 140.3929),
-    "RKSS": (37.4602, 126.4407), "WSSS": (1.3644, 103.9915), "VHHH": (22.3020, 114.1742),
-    "ZBAA": (40.0801, 116.5970), "ZSPD": (31.1434, 121.8050), "YSSY": (-33.9461, 151.1772),
-    "NZAA": (-37.0082, 174.7917), "SBGR": (-23.4356, -46.4731), "SAEZ": (-34.8222, -58.5358),
-    "KDFW": (32.8471, -96.8518), "KIAH": (29.9902, -95.3368), "KPHX": (33.4373, -112.0078),
-    "KLAS": (36.0840, -115.1537), "LEMD": (40.4983, -3.5676), "LIRF": (41.8003, 12.2389),
-    "EDDM": (48.3538, 11.7861), "EIDW": (53.4264, -6.2499), "VTBS": (13.6900, 100.7501),
-    "VABB": (19.0896, 72.8656), "VIDP": (28.5562, 77.1000), "RCTP": (25.0797, 121.2342),
-}
-
-NAME_TO_CODE = {
-    "TOKYO": "RJTT", "CHICAGO": "KORD", "NEW YORK": "KJFK", "NYC": "KJFK",
-    "TORONTO": "CYYZ", "LONDON": "EGLL", "MIAMI": "KMIA", "ATLANTA": "KATL",
-    "SEATTLE": "KSEA", "DENVER": "KDEN", "LOS ANGELES": "KLAX", "VANCOUVER": "CYVR",
-    "EDMONTON": "CYEG", "MONTREAL": "CYUL", "PARIS": "LFPG", "FRANKFURT": "EDDF",
-    "AMSTERDAM": "EHAM", "BARCELONA": "LEBL", "ROME": "LIRF", "SEOUL": "RKSS",
-    "SINGAPORE": "WSSS", "DUBAI": "OMDB", "AUCKLAND": "NZAA", "SYDNEY": "YSSY",
-    "HONOLULU": "PHNL", "JAKARTA": "WIII", "SHENZHEN": "ZGSZ", "BEIJING": "ZBAA",
-    "HONG KONG": "VHHH", "SHANGHAI": "ZSPD", "HOUSTON": "KIAH", "MEXICO CITY": "MMMX",
-    "KUALA LUMPUR": "WMKK", "TEL AVIV": "LLBG", "SAN FRANCISCO": "KSFO",
-    "DALLAS": "KDFW", "TAIPEI": "RCTP", "ANKARA": "LTAC", "WELLINGTON": "NZWN",
-    "MUNICH": "EDDM", "MILAN": "LIMC", "MADRID": "LEMD", "WARSAW": "EPWA",
-    "AUSTIN": "KAUS", "PHOENIX": "KPHX", "SAO PAULO": "SBGR", "BUENOS AIRES": "SAEZ",
-    "BOSTON": "KBOS", "PHILADELPHIA": "KPHL", "SAN DIEGO": "KSAN", "LAS VEGAS": "KLAS",
-    "CALGARY": "CYYC", "OTTAWA": "CYOW", "DUBLIN": "EIDW", "LISBON": "LPPT",
-    "COPENHAGEN": "EKCH", "STOCKHOLM": "ESSA", "OSLO": "ENGM", "HELSINKI": "EFHK",
-    "PRAGUE": "LKPR", "VIENNA": "LOWW", "ZURICH": "LSZH", "BRUSSELS": "EBBR",
-    "MALAGA": "LEMG", "VALENCIA": "LEVC", "SEVILLE": "LEZL", "BILBAO": "LEBB",
-    "GLASGOW": "EGPF", "MANCHESTER": "EGCC", "EDINBURGH": "EGPH", "MUMBAI": "VABB",
-    "DELHI": "VIDP", "BANGKOK": "VTBS", "OSAKA": "RJBB", "NAGOYA": "RJGG",
-    "KYOTO": "RJOT", "FUKUOKA": "RJFF", "PERTH": "YPPH", "BRISBANE": "YBBN",
-    "MELBOURNE": "YMML", "ADELAIDE": "YPAD", "CHRISTCHURCH": "NZCH",
-    "FORT WORTH": "KDFW", "DFW": "KDFW", "VEGAS": "KLAS", "ROMA": "LIRF",
-    "MUNCHEN": "EDDM", "BOMBAY": "VABB", "NEW DELHI": "VIDP",
-}
-
-CITY_OVERRIDES = {
-    "NEW YORK": "KJFK", "LONDON": "EGLL", "MIAMI": "KMIA", "ATLANTA": "KATL",
-    "DENVER": "KDEN", "LOS ANGELES": "KLAX", "TAIPEI": "RCTP", "SEOUL": "RKSS",
-    "JAKARTA": "WIII", "WASHINGTON": "KDCA", "BOSTON": "KBOS",
-    "PHILADELPHIA": "KPHL", "SAN DIEGO": "KSAN", "LAS VEGAS": "KLAS",
-    "MUMBAI": "VABB", "DELHI": "VIDP", "OSAKA": "RJBB", "NAGOYA": "RJGG",
-    "KYOTO": "RJOT", "CHRISTCHURCH": "NZCH",
-}
-
-CODE_TO_NAME = {v: k for k, v in NAME_TO_CODE.items()}
-
+# ── City/ICAO helpers (using config.py) ────────────────────────────────────────────────────────
 
 def normalize_market_text(text: str) -> str:
     """Normalize market text for matching."""
@@ -144,146 +92,309 @@ def normalize_market_text(text: str) -> str:
 
 def city_to_code(city: str) -> Optional[str]:
     """Convert city name to ICAO code."""
+    from config import NAME_TO_CODE, CITY_TO_ICAO
     c = normalize_market_text(city)
-    return CITY_OVERRIDES.get(c) or NAME_TO_CODE.get(c)
+    return CITY_TO_ICAO.get(c) or NAME_TO_CODE.get(c)
 
 
 def city_to_coords(city: str):
     """Get coordinates for a city."""
+    from config import get_coords
     code = city_to_code(city)
     if not code:
         return None
-    return LOCAL_COORDS.get(code)
+    return get_coords(code)
 
 
-def resolve_market_city(comment_text: str) -> Optional[str]:
-    """Resolve city from market comment text."""
-    s = normalize_market_text(comment_text)
-    if "NEW YORK" in s: return "NEW YORK"
-    if "WASHINGTON" in s: return "WASHINGTON"
-    if "LOS ANGELES" in s: return "LOS ANGELES"
-    if "SAN FRANCISCO" in s: return "SAN FRANCISCO"
-    if "HONG KONG" in s: return "HONG KONG"
-    if "MEXICO CITY" in s: return "MEXICO CITY"
-    if "KUALA LUMPUR" in s: return "KUALA LUMPUR"
-    if "SAO PAULO" in s: return "SAO PAULO"
-    if "BUENOS AIRES" in s: return "BUENOS AIRES"
-    if "QUEBEC CITY" in s: return "QUEBEC CITY"
-    if "BOSTON" in s: return "BOSTON"
-    if "PHILADELPHIA" in s: return "PHILADELPHIA"
-    if "SAN DIEGO" in s: return "SAN DIEGO"
-    if "DALLAS" in s or "DFW" in s or "FORT WORTH" in s: return "DALLAS"
-    if "HOUSTON" in s: return "HOUSTON"
-    if "PHOENIX" in s: return "PHOENIX"
-    if "LAS VEGAS" in s or "VEGAS" in s: return "LAS VEGAS"
-    if "CALGARY" in s: return "CALGARY"
-    if "OTTAWA" in s: return "OTTAWA"
-    if "DUBLIN" in s: return "DUBLIN"
-    if "LISBON" in s: return "LISBON"
-    if "MADRID" in s: return "MADRID"
-    if "ROME" in s or "ROMA" in s: return "ROME"
-    if "MUNICH" in s or "MUNCHEN" in s: return "MUNICH"
-    if "STOCKHOLM" in s: return "STOCKHOLM"
-    if "OSLO" in s: return "OSLO"
-    if "HELSINKI" in s: return "HELSINKI"
-    if "PRAGUE" in s: return "PRAGUE"
-    if "VIENNA" in s: return "VIENNA"
-    if "ZURICH" in s: return "ZURICH"
-    if "BRUSSELS" in s: return "BRUSSELS"
-    if "MALAGA" in s: return "MALAGA"
-    if "VALENCIA" in s: return "VALENCIA"
-    if "SEVILLE" in s: return "SEVILLE"
-    if "BILBAO" in s: return "BILBAO"
-    if "GLASGOW" in s: return "GLASGOW"
-    if "MANCHESTER" in s: return "MANCHESTER"
-    if "EDINBURGH" in s: return "EDINBURGH"
-    if "MUMBAI" in s or "BOMBAY" in s: return "MUMBAI"
-    if "DELHI" in s or "NEW DELHI" in s: return "DELHI"
-    if "BANGKOK" in s: return "BANGKOK"
-    if "TAIPEI" in s: return "TAIPEI"
-    if "OSAKA" in s: return "OSAKA"
-    if "NAGOYA" in s: return "NAGOYA"
-    if "KYOTO" in s: return "KYOTO"
-    if "FUKUOKA" in s: return "FUKUOKA"
-    if "PERTH" in s: return "PERTH"
-    if "BRISBANE" in s: return "BRISBANE"
-    if "MELBOURNE" in s: return "MELBOURNE"
-    if "ADELAIDE" in s: return "ADELAIDE"
-    if "CHRISTCHURCH" in s: return "CHRISTCHURCH"
-    return None
+# ── Coherence Filters ──────────────────────────────────────────────────────────
+
+MIN_HISTORY = 5
+HISTORY_SPREAD_MAX = 0.05
+
+signal_history: dict[tuple, list[float]] = defaultdict(list)
 
 
-def resolve_market_city_name(text: str) -> str:
-    """Resolve market city name from text."""
-    return resolve_market_city(text) or "UNKNOWN"
+def apply_coherence_filters(decision: GateDecision, rung, city: str) -> tuple[bool, str]:
+    """Require signal coherence before execution: persistence, direction, adaptive floor."""
+    key = (city, rung.threshold_celsius, rung.temp_type)
+
+    signal_history[key].append(decision.edge)
+    signal_history[key] = signal_history[key][-MIN_HISTORY:]
+
+    if len(signal_history[key]) < MIN_HISTORY:
+        return False, "awaiting history"
+
+    spread = max(signal_history[key]) - min(signal_history[key])
+    if spread > HISTORY_SPREAD_MAX:
+        return False, f"edge unstable (spread={spread:.3f})"
+
+    uncertainty = 1 - abs(decision.model_prob - 0.5) * 2
+    dynamic_floor = 0.04 + (uncertainty * 0.08)
+
+    if rung.resolution_datetime:
+        hours_left = (rung.resolution_datetime - datetime.now(timezone.utc)).total_seconds() / 3600
+        if hours_left > 48:
+            dynamic_floor *= 1.5
+        elif hours_left > 24:
+            dynamic_floor *= 1.2
+
+    if abs(decision.edge) < dynamic_floor:
+        return False, f"below dynamic floor ({abs(decision.edge):.3f} < {dynamic_floor:.3f})"
+
+    edge_signs = {1 if e > 0 else -1 for e in signal_history[key] if e != 0}
+    if len(edge_signs) > 1:
+        return False, "crossed signal (edge direction unstable)"
+
+    if decision.action == "PASS":
+        return False, "no gate signal"
+
+    return True, "passed"
 
 
-def resolve_market_icao(comment_text: str) -> Optional[str]:
-    """Resolve ICAO code from market comment text."""
-    city = resolve_market_city(comment_text)
-    if not city:
-        return None
-    return city_to_code(city)
+# ── Regime / Entropy Tracker ───────────────────────────────────────────────────
+
+import math
+from collections import deque
+
+MAX_ENTROPY_BUFFER = 20
+MIN_ENTROPY_SAMPLES = 5
+
+entropy_buffer: dict[tuple, deque[float]] = defaultdict(lambda: deque(maxlen=MAX_ENTROPY_BUFFER))
 
 
-def resolve_market_coords(comment_text: str):
-    """Resolve coordinates from market comment text."""
-    city = resolve_market_city(comment_text)
-    if not city:
-        return None
-    return city_to_coords(city)
+def _signal_energy(decision: GateDecision, rung) -> float:
+    return abs(decision.model_prob - rung.yes_price) + abs(decision.edge)
+
+
+def _compute_entropy(values: list[float]) -> float:
+    if len(values) < MIN_ENTROPY_SAMPLES:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((x - mean) ** 2 for x in values) / len(values)
+    return math.sqrt(variance)
+
+
+def record_signal_energy(decision: GateDecision, rung, icao: str) -> None:
+    """Append energy observation to entropy buffer after decision is made."""
+    key = (icao, rung.temp_type)
+    energy = _signal_energy(decision, rung)
+    entropy_buffer[key].append(energy)
 
 
 # ── Core components ────────────────────────────────────────────────────────────
 
-# Create persistent Oracle instances to maintain cache across iterations
+_nodes = {icao: MirrorFieldNode(icao) for icao in ICAO_LIST}
+_mesh = MirrorFieldMesh(_nodes)
+
+import rossby as _rossby_module
+
 oracles = {icao: Oracle(icao) for icao in ICAO_LIST}
+executor = Executor(BANKROLL_STATIC)
 gate = MirrorGate()
-executor = Executor(BANKROLL)
-market_scraper = MarketScraper()
 
 
-# ── Main Loop Functions ────────────────────────────────────────────────────────
+def _system_market_entropy() -> float:
+    """Average market entropy across all tracked (icao, temp_type) pairs."""
+    if not entropy_buffer:
+        return 0.0
+    total = 0.0
+    count = 0
+    for values in entropy_buffer.values():
+        vals = list(values)
+        if len(vals) >= 5:
+            mean = sum(vals) / len(vals)
+            variance = sum((x - mean) ** 2 for x in vals) / len(vals)
+            total += math.sqrt(variance)
+            count += 1
+    return total / count if count > 0 else 0.0
+
+
+def _market_entropy_for(icao: str) -> float:
+    """Per-node market entropy: average of TX and TN buffers for this ICAO."""
+    keys = [(icao, "TX"), (icao, "TN")]
+    entropies = []
+    for key in keys:
+        if key in entropy_buffer:
+            vals = list(entropy_buffer[key])
+            if len(vals) >= 5:
+                mean = sum(vals) / len(vals)
+                variance = sum((x - mean) ** 2 for x in vals) / len(vals)
+                entropies.append(math.sqrt(variance))
+    return sum(entropies) / len(entropies) if entropies else 0.0
+
 
 async def poll_markets():
     """Poll markets for a single iteration — called by the async loop."""
+    await executor.sync_bankroll()  # Sync live USDC balance before each cycle
+    logger.info("Initiating market scan cycle across all regions...")
+
+    atmo_entropy = _rossby_module.get_system_atmo_entropy()
+    model_uncertainty = 0.0
+
+    mesh_inputs = {
+        icao: {
+            "atmo_entropy": atmo_entropy,
+            "market_entropy": _market_entropy_for(icao),
+            "model_uncertainty": model_uncertainty,
+        }
+        for icao in ICAO_LIST
+    }
+    mesh_result = _mesh.update(mesh_inputs)
+
+    logger.debug(
+        f"Mirror mesh: global_C={mesh_result['global_coherence']:.3f} "
+        f"spatial_S={mesh_result['spatial_entropy']:.3f} "
+        f"sync={mesh_result['synchronization']:.3f} "
+        f"regime={mesh_result['regime']}"
+    )
+
     for icao, city in zip(ICAO_LIST, CITY_LIST):
         try:
-            # Use persistent oracle (maintains _last_issued cache)
             oracle = oracles[icao]
-            reading = oracle.pull()
-            if not reading:
-                continue
-
-            logger.info(f"Oracle {reading.icao} TX={reading.tx_celsius:.0f}°C source={reading.source} issued={reading.issued_at}")
-
-            # Get current UTC hour for time-based filtering
             current_utc_hour = datetime.now(timezone.utc).hour
-
-            # Scan rungs and execute — pass actual TAF tx, not rung mean
-            for rung in executor.scan_rungs(city, reading.tx_celsius, icao=icao, current_utc_hour=current_utc_hour):
-                # Pass actual TAF tx to gate instead of rung distribution mean
-                decision = gate.assess(
-                    taf_tx=reading.tx_celsius,  # Actual TAF temperature
-                    market_threshold=rung.threshold_celsius,
-                    market_prob=rung.market_price,
-                    outcome_type=rung.outcome_type,
-                )
-                result = executor.execute(decision, f"{icao}_{rung.market_id}", BANKROLL)
-                if result.get("status") == "executed":
-                    logger.info(f"Trade executed: {decision} {result.get('trade', {}).get('quantity', 0):.2f} @ ${result.get('trade', {}).get('price', 0):.2f}")
-
-            # Market-side: fetch and match
-            markets = await market_scraper.fetch_markets(keywords=f"{city} temperature", limit=50)
-            for m in markets:
-                if not market_scraper.match_to_city(m, city):  # Use city name, not ICAO
+            
+            rungs = await executor.scan_rungs(city, icao=icao, current_utc_hour=current_utc_hour)
+            if not rungs:
+                continue
+                
+            # Group by day so we only pull oracle once per day
+            rungs_by_day = defaultdict(list)
+            for r in rungs:
+                day = r.resolution_datetime.strftime("%Y-%m-%d")
+                rungs_by_day[day].append(r)
+                
+            for day, day_rungs in rungs_by_day.items():
+                resolution_time = day_rungs[0].resolution_datetime
+                
+                # Skip markets that have already resolved
+                hours_left = (resolution_time - datetime.now(timezone.utc)).total_seconds() / 3600
+                if hours_left <= 0:
+                    logger.debug(f"Skipping expired market {icao} [{day}] (resolved {abs(hours_left):.1f}h ago)")
                     continue
-                lage = market_scraper.lag_edge(m, reading.tx_celsius)
-                if lage > 0.02:
-                    logger.warning(f"Market {m.city} lag=0.020 mid=0.300")
+                
+                # Skip TX/TN markets for TODAY where temp extreme has already passed
+                resolution_date = resolution_time.date()
+                today = datetime.now(timezone.utc).date()
+                
+                if resolution_date == today:
+                    if day_rungs[0].temp_type == "TX" and executor._high_has_passed(icao, current_utc_hour, "TX"):
+                        logger.debug(f"Skipping {icao} TX [{day}] - daily high already passed")
+                        continue
+                    if day_rungs[0].temp_type == "TN" and executor._high_has_passed(icao, current_utc_hour, "TN"):
+                        logger.debug(f"Skipping {icao} TN [{day}] - daily low already passed")
+                        continue
 
+                reading = await oracle.pull(resolution_time=resolution_time)
+                if not reading:
+                    continue
+
+                tn_str = f" TN={reading.tn_celsius:.1f}°C" if reading.tn_celsius is not None else ""
+                logger.info(f"Oracle {reading.icao} TX={reading.tx_celsius:.1f}°C{tn_str} [{day}] source={reading.source} | {reading.raw}")
+
+                # Check if this market should be traded (focused markets)
+                market_date = day
+                template = get_market_template(city, market_date)
+                is_focused = should_trade_market(city, market_date)
+
+                if not is_focused:
+                    logger.debug(f"Skipping {icao} [{day}] - not in focused markets")
+                    continue
+
+                # Use template to get core band sizing
+                tx_temp = reading.tx_celsius
+                tn_temp = reading.tn_celsius
+
+                for rung in day_rungs:
+                    # Get target temp for this rung type
+                    target_temp = tx_temp if rung.temp_type == "TX" else tn_temp
+                    if target_temp is None:
+                        logger.warning(f"No target temp for {icao} {day} {rung.temp_type}")
+                        continue
+                    
+                    # Check if this specific bin should be traded
+                    # Get gate decision
+                    decision = gate.assess(
+                        taf_tx=target_temp,
+                        market_threshold=rung.threshold_celsius,
+                        market_prob=rung.yes_price,
+                        outcome_type=rung.outcome_type,
+                    )
+                    
+                    # UI Pin check: confirmed distortion only
+                    pin_triggered = False
+                    if is_ui_pin_opportunity(city, rung.threshold_celsius, rung.yes_price, decision.model_prob):
+                        if decision.edge >= 0.08:
+                            pin_size = calculate_pin_short_size(decision.model_prob, rung.yes_price)
+                            if pin_size > 0:
+                                decision.action = "SELL_NO"
+                                decision.edge = abs(decision.edge)
+                                pin_triggered = True
+                                logger.info(f"UI PIN CONFIRMED: {icao} [{rung.threshold_celsius:.1f}°C] {rung.yes_price*100:.1f}% vs {decision.model_prob*100:.1f}% — shorting ${pin_size}")
+
+                    if not pin_triggered:
+                        passes, filter_reason = apply_coherence_filters(decision, rung, city)
+                        if not passes:
+                            logger.debug(f"Filtered {icao} {rung.threshold_celsius:.1f}°C: {filter_reason}")
+                            continue
+
+                    size_multiplier = mesh_result["global_coherence"]  # 0-1 based on system coherence
+                    
+                    # Use template-based sizing for focused markets
+                    if is_focused and template:
+                        # Adjust size based on template
+                        is_in_core = template.core_band_celsius[0] <= rung.threshold_celsius <= template.core_band_celsius[1]
+                        if is_in_core:
+                            # Core band - full size
+                            pass  # Use gate's sizing
+                        else:
+                            # Not in core - may reduce size
+                            if abs(rung.threshold_celsius - target_temp) > 5:
+                                # Far tail - reduce significantly
+                                decision.edge *= 0.5
+                    
+                    type_label = "High" if rung.temp_type == "TX" else "Low"
+                    logger.info(f"Signal {icao} {type_label} [{rung.threshold_celsius:.1f}°C]: {decision.action} | {decision.reason} | Edge: {decision.edge*100:.1f}% | mesh_result={mesh_result['regime']}")
+                    if decision.action != "PASS":
+                        await send_telegram_message(
+                            format_signal_alert(
+                                icao=icao,
+                                temp_type=type_label,
+                                threshold=rung.threshold_celsius,
+                                action=decision.action,
+                                edge=decision.edge * 100,
+                                source=reading.source,
+                            )
+                        )
+
+                    result = await executor.execute(decision, rung, size_multiplier=size_multiplier)
+                    if result.get("status") == "executed":
+                        mode = "DRY_RUN" if result.get("dry_run") else "LIVE"
+                        logger.info(f"Trade executed [{mode}]: {decision.action} {icao} {type_label} [{rung.threshold_celsius:.1f}°C] edge={decision.edge*100:.1f}% mesh_result={mesh_result['regime']}")
+                        record_signal_energy(decision, rung, icao)
+                        trade_size = result.get("size", 0)
+                        trade_price = rung.yes_price if decision.action in ("BUY_YES", "LEAN_YES") else rung.no_price
+                        await send_telegram_message(
+                            format_trade_alert(
+                                action=decision.action,
+                                market=rung.question[:60],
+                                size=trade_size,
+                                price=trade_price,
+                                edge=decision.edge * 100,
+                                dry_run=result.get("dry_run", False),
+                            )
+                        )
+
+        except RuntimeError as e:
+            if "DORMANT" in str(e):
+                logger.info(f"Dormant {icao}: {e}")
+            else:
+                logger.error(f"Poll runtime error {icao}: {e}", exc_info=True)
+                await send_telegram_message(format_error_alert(icao, str(e)))
         except Exception as e:
             logger.error(f"Poll error {icao}: {e}", exc_info=True)
+            await send_telegram_message(format_error_alert(icao, str(e)))
+
+        await asyncio.sleep(2.5)
 
 
 async def refresh_taf():
@@ -291,12 +402,22 @@ async def refresh_taf():
     for icao, city in zip(ICAO_LIST, CITY_LIST):
         try:
             oracle = oracles[icao]
-            reading = oracle.pull()
+            reading = await oracle.pull()
             if reading:
                 if oracle.is_new(reading):
                     logger.info(f"NEW {reading.icao} TX={reading.tx_celsius:.0f}°C source={reading.source} issued={reading.issued_at}")
+                    if reading.source == "taf":
+                        tn_str = f" TN={reading.tn_celsius:.0f}°C" if reading.tn_celsius is not None else ""
+                        await send_telegram_message(
+                            f"*Aelthara Oracle Update*\n{reading.icao}{tn_str} = {reading.tx_celsius:.0f}°C\nSource: {reading.source}"
+                        )
                 else:
                     logger.debug(f"Cached {reading.icao} TX={reading.tx_celsius:.0f}°C source={reading.source}")
+        except RuntimeError as e:
+            if "DORMANT" in str(e):
+                logger.info(f"Dormant {icao}: {e}")
+            else:
+                logger.error(f"Oracle runtime error {icao}: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Oracle error {icao}: {e}", exc_info=True)
 
@@ -304,8 +425,10 @@ async def refresh_taf():
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 
 async def main():
-    logger.info(f"Pulse started | BANKROLL=${BANKROLL:,.0f}")
-    logger.info(f"Running | TAF refresh every {TAF_INTERVAL_HOURS}h | Poll every {PRICE_POLL_MINUTES}min")
+    bankroll = executor.bankroll
+    mode_tag = "LIVE" if USE_LIVE_BANKROLL else "CONFIG"
+    logger.info(f"Pulse started | BANKROLL=${bankroll:,.2f} [{mode_tag}]")
+    logger.info(f"Running | TAF refresh every {TAF_INTERVAL_HOURS}h | Poll every {PRICE_POLL_MINUTES}min | LIVE_BANKROLL={USE_LIVE_BANKROLL}")
 
     taf_interval = TAF_INTERVAL_HOURS * 3600  # seconds
     poll_interval = PRICE_POLL_MINUTES * 60   # seconds
